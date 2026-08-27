@@ -1,0 +1,25 @@
+# Dependencies and generated output
+node_modules/
+dist/
+out/
+.vscode-test/
+*.vsix
+
+# Local Patch Transfer data
+.patch-transfer/
+
+# Test and tool output
+coverage/
+.pnpm-store/
+*.log
+*.tmp
+*.temp
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# OS metadata
+.DS_Store
+Thumbs.db

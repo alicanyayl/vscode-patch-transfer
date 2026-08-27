@@ -1,0 +1,140 @@
+{
+  "name": "patch-transfer",
+  "displayName": "Patch Transfer",
+  "description": "offline patch transfer maneger for vs code ",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.134.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:patch-transfer.changes",
+    "onView:patch-transfer.patches",
+    "onCommand:patch-transfer.refresh",
+    "onCommand:patch-transfer.refreshPatches",
+    "onCommand:patch-transfer.createPatch",
+    "onCommand:patch-transfer.applyPatch",
+    "onCommand:patch-transfer.showPatchError"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "patch-transfer.createPatch",
+        "title": "Create Patch",
+        "icon": "$(file-add)"
+      },
+      {
+        "command": "patch-transfer.refresh",
+        "title": "Refresh Changes",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "patch-transfer.refreshPatches",
+        "title": "Refresh Patches",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "patch-transfer.applyPatch",
+        "title": "Apply Patch",
+        "icon": "$(check)",
+        "enablement": "patchTransfer.patchReady"
+      },
+      {
+        "command": "patch-transfer.showPatchError",
+        "title": "Show Patch Error",
+        "icon": "$(output)",
+        "enablement": "patchTransfer.patchHasError"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "patch-transfer",
+          "title": "Patch Transfer",
+          "icon": "media/patch-transfer.svg"
+        }
+      ]
+    },
+    "views": {
+      "patch-transfer": [
+        {
+          "id": "patch-transfer.changes",
+          "name": "Changes"
+        },
+        {
+          "id": "patch-transfer.patches",
+          "name": "Patches"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "patch-transfer.createPatch",
+          "when": "view == patch-transfer.changes",
+          "group": "navigation@1"
+        },
+        {
+          "command": "patch-transfer.refresh",
+          "when": "view == patch-transfer.changes",
+          "group": "navigation@2"
+        },
+        {
+          "command": "patch-transfer.refreshPatches",
+          "when": "view == patch-transfer.patches",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "patch-transfer.applyPatch",
+          "when": "view == patch-transfer.patches && viewItem == patchTransfer.patch.ready",
+          "group": "inline@1"
+        },
+        {
+          "command": "patch-transfer.showPatchError",
+          "when": "view == patch-transfer.patches && viewItem == patchTransfer.patch.conflict",
+          "group": "inline@1"
+        },
+        {
+          "command": "patch-transfer.showPatchError",
+          "when": "view == patch-transfer.patches && viewItem == patchTransfer.patch.invalid",
+          "group": "inline@1"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "pnpm run package",
+    "compile": "pnpm run check-types && pnpm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "pnpm run check-types && pnpm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "pnpm run compile-tests && pnpm run compile && pnpm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.134.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "typescript-eslint": "^8.61.1",
+    "eslint": "^10.5.0",
+    "esbuild": "^0.28.1",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^6.0.3",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  }
+}
