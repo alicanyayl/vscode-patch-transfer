@@ -1,71 +1,50 @@
-# patch-transfer README
+# Patch Transfer
 
-This is the README for your extension "patch-transfer". After writing up a brief description, we recommend including the following sections.
+Patch Transfer is a VS Code extension for transferring Git-based code changes between independent online and offline repositories.
 
 ## Features
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
-
-For example if there is an image subfolder under your extension project workspace:
-
-\!\[feature X\]\(images/feature-x.png\)
-
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+- View Git working-tree changes
+- Write or generate a commit message
+- Create timestamped patch files
+- Automatically commit and push source changes
+- Copy patches to external folders or USB drives
+- Import patches into another repository
+- Detect duplicate patches using SHA-256
+- Show patch status as Created, Ready, Applied, Conflict, or Invalid
+- Apply patches safely without requiring matching Git histories
+- Keep `.patch-transfer/` local through Git `info/exclude`
 
 ## Requirements
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+- Git must be installed and available in PATH
+- VS Code
+- Copilot is optional and only used for AI commit-message generation
 
-## Extension Settings
+## Usage
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+Source repository:
 
-For example:
+1. Edit files.
+2. Enter or generate a commit message.
+3. Select **Create Patch**.
+4. Optionally select **Copy To...** and copy the patch to a USB drive.
 
-This extension contributes the following settings:
+Destination repository:
 
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+1. Select **Import Patch**.
+2. Choose the patch file.
+3. Confirm the patch is **Ready**.
+4. Select **Apply Patch**.
 
-## Known Issues
+Patch files are stored locally under:
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
+`.patch-transfer/`
 
-## Release Notes
+Applied and created patch state is stored inside the repository Git directory.
 
-Users appreciate release notes as you update your extension.
+## Notes
 
-### 1.0.0
+Patch Transfer is designed for repositories that may have independent Git histories.
 
-Initial release of ...
-
-### 1.0.1
-
-Fixed issue #.
-
-### 1.1.0
-
-Added features X, Y, and Z.
-
----
-
-## Following extension guidelines
-
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
-
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
-
-**Enjoy!**
+The destination repository is not automatically committed or pushed after a patch is applied.

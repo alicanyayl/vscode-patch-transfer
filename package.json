@@ -9,12 +9,16 @@
   "categories": [
     "Other"
   ],
+  "extensionDependencies": [
+    "vscode.git"
+  ],
   "activationEvents": [
     "onView:patch-transfer.changes",
     "onView:patch-transfer.patches",
     "onCommand:patch-transfer.refresh",
     "onCommand:patch-transfer.refreshPatches",
     "onCommand:patch-transfer.createPatch",
+    "onCommand:patch-transfer.importPatch",
     "onCommand:patch-transfer.applyPatch",
     "onCommand:patch-transfer.showPatchError"
   ],
@@ -35,6 +39,11 @@
         "command": "patch-transfer.refreshPatches",
         "title": "Refresh Patches",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "patch-transfer.importPatch",
+        "title": "Import Patch",
+        "icon": "$(file-add)"
       },
       {
         "command": "patch-transfer.applyPatch",
@@ -62,7 +71,8 @@
       "patch-transfer": [
         {
           "id": "patch-transfer.changes",
-          "name": "Changes"
+          "name": "Changes",
+          "type": "webview"
         },
         {
           "id": "patch-transfer.patches",
@@ -83,9 +93,14 @@
           "group": "navigation@2"
         },
         {
+          "command": "patch-transfer.importPatch",
+          "when": "view == patch-transfer.patches",
+          "group": "navigation@1"
+        },
+        {
           "command": "patch-transfer.refreshPatches",
           "when": "view == patch-transfer.patches",
-          "group": "navigation"
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [

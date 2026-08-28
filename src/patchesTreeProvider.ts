@@ -174,6 +174,14 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 
 function getPatchPresentation(status: PatchStatus): PatchPresentation {
 	switch (status) {
+		case 'CREATED':
+			return {
+				description: 'Created',
+				icon: new vscode.ThemeIcon(
+					'check',
+					new vscode.ThemeColor('testing.iconPassed'),
+				),
+			};
 		case 'READY':
 			return {
 				description: 'Ready',

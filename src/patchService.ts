@@ -1,4 +1,5 @@
-import { appendFile, mkdir, readdir, readFile, stat } from 'fs/promises';
+import { constants } from 'fs';
+import { appendFile, copyFile, mkdir, readdir, readFile, stat } from 'fs/promises';
 import { EOL } from 'os';
 import { basename, dirname, extname, join, resolve } from 'path';
 import { GitService } from './gitService';
@@ -6,10 +7,19 @@ import { PatchState, PatchStateService } from './patchStateService';
 
 export type CreatePatchResult =
 	| { status: 'noChanges' }
-	| { status: 'success'; patchName: string }
-	| { status: 'pushFailed'; patchName: string; error: string };
+	| { status: 'success'; patchName: string; patchPath: string }
+	| { status: 'pushFailed'; patchName: string; patchPath: string; error: string };
 
-export type PatchStatus = 'READY' | 'APPLIED' | 'CONFLICT' | 'INVALID';
+export type CopyPatchResult =
+	| { status: 'copied'; fileName: string; destinationPath: string; renamed: boolean }
+	| { status: 'alreadyExists'; fileName: string; destinationPath: string };
+
+export type ImportPatchResult =
+	| { status: 'imported'; patchName: string; patchPath: string; renamed: boolean }
+	| { status: 'invalid'; error: string }
+	| { status: 'alreadyExists'; patchName: string; patchPath: string };
+
+export type PatchStatus = 'CREATED' | 'READY' | 'APPLIED' | 'CONFLICT' | 'INVALID';
 
 export interface PatchFile {
 	name: string;
@@ -28,6 +38,7 @@ export interface PatchApplicationPlan {
 export type ApplyPatchResult =
 	| { status: 'applied'; patchName: string }
 	| { status: 'alreadyApplied'; patchName: string }
+	| { status: 'created'; patchName: string }
 	| { status: 'notReady'; patchName: string; patchStatus: 'CONFLICT' | 'INVALID'; error: string }
 	| { status: 'applyFailed'; patchName: string; error: string }
 	| { status: 'stateSaveFailed'; patchName: string; error: string };
@@ -37,6 +48,14 @@ interface PatchCandidate {
 	path: string;
 	timestamp: Date;
 }
+
+type TransferPatchResult =
+	| { status: 'copied'; fileName: string; path: string; renamed: boolean }
+	| { status: 'alreadyExists'; fileName: string; path: string };
+
+type PatchDestinationResolution =
+	| { status: 'available'; fileName: string; path: string }
+	| { status: 'alreadyExists'; fileName: string; path: string };
 
 export class PatchService {
 	private readonly stateService: PatchStateService;
@@ -48,7 +67,88 @@ export class PatchService {
 		this.stateService = stateService ?? new PatchStateService(gitService);
 	}
 
-	async createPatch(workspacePath: string): Promise<CreatePatchResult> {
+	async ensureRepositorySetup(workspacePath: string): Promise<void> {
+		const repositoryPath = await this.gitService.getRepositoryRoot(workspacePath);
+		if (repositoryPath) {
+			await this.ensureLocalExclude(repositoryPath);
+		}
+	}
+
+	async copyPatchToDirectory(
+		patchPath: string,
+		destinationDirectory: string,
+	): Promise<CopyPatchResult> {
+		const sourceSha256 = await this.stateService.calculatePatchSha256(patchPath);
+		const result = await this.transferPatchFile(
+			patchPath,
+			destinationDirectory,
+			basename(patchPath),
+			sourceSha256,
+		);
+		if (result.status === 'alreadyExists') {
+			return {
+				status: 'alreadyExists',
+				fileName: result.fileName,
+				destinationPath: result.path,
+			};
+		}
+
+		return {
+			status: 'copied',
+			fileName: result.fileName,
+			destinationPath: result.path,
+			renamed: result.renamed,
+		};
+	}
+
+	async importPatch(workspacePath: string, externalPatchPath: string): Promise<ImportPatchResult> {
+		const repositoryPath = await this.gitService.getRepositoryRoot(workspacePath);
+		if (!repositoryPath) {
+			throw new Error('Git repository not found');
+		}
+
+		if (extname(externalPatchPath).toLowerCase() !== '.patch') {
+			return { status: 'invalid', error: 'Selected file does not have a .patch extension.' };
+		}
+
+		try {
+			await this.gitService.validatePatch(repositoryPath, externalPatchPath);
+		} catch (error) {
+			return { status: 'invalid', error: this.getErrorMessage(error) };
+		}
+
+		const sourceSha256 = await this.stateService.calculatePatchSha256(externalPatchPath);
+		await this.ensureLocalExclude(repositoryPath);
+		const patchDirectory = join(repositoryPath, '.patch-transfer');
+		await mkdir(patchDirectory, { recursive: true });
+		const result = await this.transferPatchFile(
+			externalPatchPath,
+			patchDirectory,
+			basename(externalPatchPath),
+			sourceSha256,
+		);
+		if (result.status === 'alreadyExists') {
+			return {
+				status: 'alreadyExists',
+				patchName: result.fileName,
+				patchPath: result.path,
+			};
+		}
+
+		return {
+			status: 'imported',
+			patchName: result.fileName,
+			patchPath: result.path,
+			renamed: result.renamed,
+		};
+	}
+
+	async createPatch(workspacePath: string, commitMessage: string): Promise<CreatePatchResult> {
+		const normalizedCommitMessage = commitMessage.trim();
+		if (!normalizedCommitMessage) {
+			throw new Error('Enter a commit message before creating the patch.');
+		}
+
 		const repositoryPath = await this.gitService.getRepositoryRoot(workspacePath);
 		if (!repositoryPath) {
 			throw new Error('Git repository not found');
@@ -88,16 +188,28 @@ export class PatchService {
 		}
 
 		try {
-			await this.gitService.commit(repositoryPath, `Patch Transfer: ${timestamp.commit}`);
+			const sha256 = await this.stateService.calculatePatchSha256(patchPath);
+			await this.stateService.recordCreated(repositoryPath, sha256, patchName);
+		} catch (error) {
+			throw new Error(`Created patch tracking failed: ${this.getErrorMessage(error)}`);
+		}
+
+		try {
+			await this.gitService.commit(repositoryPath, normalizedCommitMessage);
 		} catch (error) {
 			throw new Error(`Commit failed: ${this.getErrorMessage(error)}`);
 		}
 
 		try {
 			await this.gitService.push(repositoryPath);
-			return { status: 'success', patchName };
+			return { status: 'success', patchName, patchPath };
 		} catch (error) {
-			return { status: 'pushFailed', patchName, error: this.getErrorMessage(error) };
+			return {
+				status: 'pushFailed',
+				patchName,
+				patchPath,
+				error: this.getErrorMessage(error),
+			};
 		}
 	}
 
@@ -157,6 +269,9 @@ export class PatchService {
 		const state = await this.stateService.load(repositoryPath);
 		if (state.applied[sha256]) {
 			return { status: 'alreadyApplied', patchName };
+		}
+		if (state.created[sha256]) {
+			return { status: 'created', patchName };
 		}
 
 		try {
@@ -226,6 +341,93 @@ export class PatchService {
 		await appendFile(excludePath, `${prefix}.patch-transfer/${lineBreak}`, 'utf8');
 	}
 
+	private async transferPatchFile(
+		sourcePath: string,
+		destinationDirectory: string,
+		preferredFileName: string,
+		sourceSha256: string,
+	): Promise<TransferPatchResult> {
+		const safePreferredFileName = basename(preferredFileName);
+
+		for (;;) {
+			const destination = await this.resolveSafePatchDestination(
+				destinationDirectory,
+				safePreferredFileName,
+				sourceSha256,
+			);
+			if (destination.status === 'alreadyExists') {
+				return destination;
+			}
+
+			try {
+				await copyFile(sourcePath, destination.path, constants.COPYFILE_EXCL);
+				return {
+					status: 'copied',
+					fileName: destination.fileName,
+					path: destination.path,
+					renamed: !this.fileNamesEqual(destination.fileName, safePreferredFileName),
+				};
+			} catch (error) {
+				if (!this.isAlreadyExistsError(error)) {
+					throw error;
+				}
+			}
+		}
+	}
+
+	private async resolveSafePatchDestination(
+		destinationDirectory: string,
+		preferredFileName: string,
+		sourceSha256: string,
+	): Promise<PatchDestinationResolution> {
+		const entries = await readdir(destinationDirectory, { withFileTypes: true });
+		const existingPatches = await Promise.all(
+			entries
+				.filter(entry => entry.isFile() && extname(entry.name).toLowerCase() === '.patch')
+				.map(async entry => ({
+					fileName: entry.name,
+					path: join(destinationDirectory, entry.name),
+					sha256: await this.stateService.calculatePatchSha256(
+						join(destinationDirectory, entry.name),
+					),
+				})),
+		);
+		const duplicate = existingPatches.find(patch => patch.sha256 === sourceSha256);
+		if (duplicate) {
+			return {
+				status: 'alreadyExists',
+				fileName: duplicate.fileName,
+				path: duplicate.path,
+			};
+		}
+
+		const isOccupied = (fileName: string): boolean =>
+			entries.some(entry => this.fileNamesEqual(entry.name, fileName));
+		if (!isOccupied(preferredFileName)) {
+			return {
+				status: 'available',
+				fileName: preferredFileName,
+				path: join(destinationDirectory, preferredFileName),
+			};
+		}
+
+		const extension = extname(preferredFileName);
+		const stem = preferredFileName.slice(0, -extension.length);
+		const shaStem = `${stem}_${sourceSha256.slice(0, 8)}`;
+		let suffix = 1;
+		for (;;) {
+			const fileName = `${shaStem}${suffix === 1 ? '' : `_${suffix}`}${extension}`;
+			if (!isOccupied(fileName)) {
+				return {
+					status: 'available',
+					fileName,
+					path: join(destinationDirectory, fileName),
+				};
+			}
+			suffix += 1;
+		}
+	}
+
 	private async readPatchCandidates(repositoryPath: string): Promise<PatchCandidate[]> {
 		const patchDirectory = join(repositoryPath, '.patch-transfer');
 
@@ -283,6 +485,9 @@ export class PatchService {
 		if (state.applied[sha256]) {
 			return { ...candidate, sha256, status: 'APPLIED' };
 		}
+		if (state.created[sha256]) {
+			return { ...candidate, sha256, status: 'CREATED' };
+		}
 
 		try {
 			await this.gitService.validatePatch(repositoryPath, candidate.path);
@@ -320,7 +525,7 @@ export class PatchService {
 		for (const candidate of olderCandidates) {
 			try {
 				const sha256 = await this.stateService.calculatePatchSha256(candidate.path);
-				if (!state.applied[sha256]) {
+				if (!state.applied[sha256] && !state.created[sha256]) {
 					return candidate.name;
 				}
 			} catch {
@@ -349,6 +554,12 @@ export class PatchService {
 		return process.platform === 'win32'
 			? resolve(left).toLowerCase() === resolve(right).toLowerCase()
 			: resolve(left) === resolve(right);
+	}
+
+	private fileNamesEqual(left: string, right: string): boolean {
+		return process.platform === 'win32'
+			? left.toLowerCase() === right.toLowerCase()
+			: left === right;
 	}
 
 	private compareNewestFirst(left: PatchCandidate, right: PatchCandidate): number {
@@ -393,7 +604,7 @@ export class PatchService {
 		return date;
 	}
 
-	private createTimestamp(date: Date): { file: string; commit: string } {
+	private createTimestamp(date: Date): { file: string } {
 		const year = date.getFullYear();
 		const month = this.pad(date.getMonth() + 1);
 		const day = this.pad(date.getDate());
@@ -403,7 +614,6 @@ export class PatchService {
 
 		return {
 			file: `${year}-${month}-${day}_${hours}${minutes}${seconds}`,
-			commit: `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`,
 		};
 	}
 
@@ -413,5 +623,9 @@ export class PatchService {
 
 	private getErrorMessage(error: unknown): string {
 		return error instanceof Error ? error.message : String(error);
+	}
+
+	private isAlreadyExistsError(error: unknown): boolean {
+		return (error as NodeJS.ErrnoException).code === 'EEXIST';
 	}
 }

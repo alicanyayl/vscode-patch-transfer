@@ -1,0 +1,211 @@
+body {
+	padding: 0 8px 8px;
+}
+
+.changes-view {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.message-container {
+	position: relative;
+}
+
+textarea,
+button {
+	box-sizing: border-box;
+	font: inherit;
+}
+
+textarea {
+	display: block;
+	width: 100%;
+	min-height: 52px;
+	max-height: 160px;
+	resize: none;
+	overflow-y: auto;
+	padding: 6px 34px 6px 7px;
+	border: 1px solid var(--vscode-input-border, transparent);
+	outline: none;
+	color: var(--vscode-input-foreground);
+	background: var(--vscode-input-background);
+}
+
+textarea:focus {
+	border-color: var(--vscode-focusBorder);
+}
+
+textarea::placeholder {
+	color: var(--vscode-input-placeholderForeground);
+}
+
+button {
+	border: 1px solid transparent;
+	cursor: pointer;
+}
+
+button:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: 1px;
+}
+
+button:disabled {
+	cursor: default;
+	opacity: 0.5;
+}
+.generate {
+	position: absolute;
+	top: 8px;
+	right: 8px;
+	width: 30px;
+	height: 30px;
+	padding: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border: 1px solid transparent;
+	border-radius: 5px;
+	background: transparent;
+	color: var(--vscode-foreground);
+	cursor: pointer;
+	box-shadow: none;
+	transition:
+		border-color 0.12s ease,
+		background-color 0.12s ease,
+		opacity 0.12s ease;
+}
+
+.generate-icon {
+	width: 18px;
+	height: 18px;
+	background-color: currentColor;
+	-webkit-mask-image: var(--sparkle-icon);
+	mask-image: var(--sparkle-icon);
+	-webkit-mask-repeat: no-repeat;
+	mask-repeat: no-repeat;
+	-webkit-mask-position: center;
+	mask-position: center;
+	-webkit-mask-size: contain;
+	mask-size: contain;
+}
+
+.generate-icon.is-busy {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background-color: transparent;
+	-webkit-mask-image: none;
+	mask-image: none;
+}
+
+.generate-icon.is-busy::before {
+	content: '…';
+	color: currentColor;
+	font-size: 17px;
+	line-height: 1;
+}
+
+.generate:hover:not(:disabled) {
+	border-color: var(--vscode-inputOption-activeBorder);
+	background-color: var(--vscode-toolbar-hoverBackground);
+}
+
+.generate:active:not(:disabled) {
+	background-color: var(--vscode-toolbar-activeBackground);
+}
+
+.generate:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder);
+	outline-offset: 1px;
+}
+
+.generate:disabled {
+	opacity: 0.35;
+	cursor: default;
+	background: transparent;
+}
+
+.create {
+	width: 100%;
+	min-height: 28px;
+	padding: 4px 10px;
+	color: var(--vscode-button-foreground);
+	background: var(--vscode-button-background);
+}
+
+.create:not(:disabled):hover {
+	background: var(--vscode-button-hoverBackground);
+}
+
+.changes {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	margin: 2px -8px 0;
+}
+
+.change-row {
+	display: grid;
+	grid-template-columns: minmax(90px, auto) minmax(0, 1fr) 20px;
+	align-items: center;
+	min-height: 22px;
+	width: 100%;
+	padding: 2px 8px;
+	border: 0;
+	text-align: left;
+	color: var(--vscode-foreground);
+	background: transparent;
+}
+
+button.change-row:hover {
+	background: var(--vscode-list-hoverBackground);
+}
+
+.file-name,
+.parent-path {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.parent-path {
+	padding-left: 8px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.change-status {
+	justify-self: end;
+	font-weight: 600;
+}
+
+.status-modified {
+	color: var(--vscode-gitDecoration-modifiedResourceForeground);
+}
+
+.status-added,
+.status-untracked {
+	color: var(--vscode-gitDecoration-untrackedResourceForeground);
+}
+
+.status-deleted {
+	color: var(--vscode-gitDecoration-deletedResourceForeground);
+}
+
+.status-renamed {
+	color: var(--vscode-gitDecoration-renamedResourceForeground);
+}
+
+.status-conflicting {
+	color: var(--vscode-gitDecoration-conflictingResourceForeground);
+}
+
+.empty-state {
+	padding: 8px;
+	color: var(--vscode-foreground);
+}
+
+.empty-description {
+	margin-top: 2px;
+	color: var(--vscode-descriptionForeground);
+}

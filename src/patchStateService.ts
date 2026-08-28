@@ -8,8 +8,14 @@ export interface AppliedPatchRecord {
 	appliedAt: string;
 }
 
+export interface CreatedPatchRecord {
+	fileName: string;
+	createdAt: string;
+}
+
 export interface PatchState {
 	version: 1;
+	created: Record<string, CreatedPatchRecord>;
 	applied: Record<string, AppliedPatchRecord>;
 }
 
@@ -41,7 +47,7 @@ export class PatchStateService {
 			}
 
 			throw new PatchStateError(
-				`Could not read applied patch state: ${statePath}. ${this.getErrorMessage(error)}`,
+				`Could not read Patch Transfer state: ${statePath}. ${this.getErrorMessage(error)}`,
 				{ cause: error },
 			);
 		}
@@ -51,18 +57,34 @@ export class PatchStateService {
 			value = JSON.parse(contents);
 		} catch (error) {
 			throw new PatchStateError(
-				`Applied patch state is malformed: ${statePath}. ${this.getErrorMessage(error)}`,
+				`Patch Transfer state is malformed: ${statePath}. ${this.getErrorMessage(error)}`,
 				{ cause: error },
 			);
 		}
 
-		if (!this.isPatchState(value)) {
+		const state = this.normalizePatchState(value);
+		if (!state) {
 			throw new PatchStateError(
-				`Applied patch state is malformed: ${statePath}. Expected version 1 state data.`,
+				`Patch Transfer state is malformed: ${statePath}. Expected version 1 state data.`,
 			);
 		}
 
-		return value;
+		return state;
+	}
+
+	async recordCreated(
+		repositoryPath: string,
+		sha256: string,
+		fileName: string,
+		createdAt = new Date(),
+	): Promise<void> {
+		const state = await this.load(repositoryPath);
+		state.created[sha256] = {
+			fileName,
+			createdAt: createdAt.toISOString(),
+		};
+
+		await this.write(repositoryPath, state);
 	}
 
 	async recordApplied(
@@ -112,41 +134,55 @@ export class PatchStateService {
 			}
 
 			throw new PatchStateError(
-				`Could not save applied patch state: ${statePath}. ${this.getErrorMessage(error)}`,
+				`Could not save Patch Transfer state: ${statePath}. ${this.getErrorMessage(error)}`,
 				{ cause: error },
 			);
 		}
 	}
 
 	private createEmptyState(): PatchState {
-		return { version: 1, applied: {} };
+		return { version: 1, created: {}, applied: {} };
 	}
 
-	private isPatchState(value: unknown): value is PatchState {
+	private normalizePatchState(value: unknown): PatchState | undefined {
 		if (!value || typeof value !== 'object') {
-			return false;
+			return undefined;
 		}
 
-		const candidate = value as { version?: unknown; applied?: unknown };
+		const candidate = value as { version?: unknown; created?: unknown; applied?: unknown };
 		if (
 			candidate.version !== 1 ||
-			!candidate.applied ||
-			typeof candidate.applied !== 'object' ||
-			Array.isArray(candidate.applied)
+			!this.isPatchRecordMap(candidate.applied, 'appliedAt') ||
+			(candidate.created !== undefined && !this.isPatchRecordMap(candidate.created, 'createdAt'))
 		) {
+			return undefined;
+		}
+
+		return {
+			version: 1,
+			created: (candidate.created ?? {}) as Record<string, CreatedPatchRecord>,
+			applied: candidate.applied as Record<string, AppliedPatchRecord>,
+		};
+	}
+
+	private isPatchRecordMap(
+		value: unknown,
+		timestampProperty: 'appliedAt' | 'createdAt',
+	): value is Record<string, AppliedPatchRecord | CreatedPatchRecord> {
+		if (!value || typeof value !== 'object' || Array.isArray(value)) {
 			return false;
 		}
 
-		return Object.entries(candidate.applied).every(([sha256, record]) => {
+		return Object.entries(value).every(([sha256, record]) => {
 			if (!/^[a-f0-9]{64}$/.test(sha256) || !record || typeof record !== 'object') {
 				return false;
 			}
 
-			const appliedRecord = record as { fileName?: unknown; appliedAt?: unknown };
+			const patchRecord = record as Record<string, unknown>;
 			return (
-				typeof appliedRecord.fileName === 'string' &&
-				typeof appliedRecord.appliedAt === 'string' &&
-				!Number.isNaN(Date.parse(appliedRecord.appliedAt))
+				typeof patchRecord.fileName === 'string' &&
+				typeof patchRecord[timestampProperty] === 'string' &&
+				!Number.isNaN(Date.parse(patchRecord[timestampProperty]))
 			);
 		});
 	}
