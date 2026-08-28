@@ -4,6 +4,21 @@ import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
 
+export const gitRequiredMessage = 'Git is required to use Patch Transfer. Install Git and reload VS Code.';
+export const repositoryRequiredMessage = 'Open a Git repository to use Patch Transfer.';
+
+export type GitRepositoryContext =
+	| { status: 'repository'; repositoryPath: string }
+	| { status: 'missingGit' }
+	| { status: 'notRepository' };
+
+export class GitExecutableNotFoundError extends Error {
+	constructor() {
+		super(gitRequiredMessage);
+		this.name = 'GitExecutableNotFoundError';
+	}
+}
+
 export interface GitChange {
 	status: string;
 	path: string;
@@ -11,9 +26,11 @@ export interface GitChange {
 }
 
 export class GitService {
+	constructor(private readonly gitExecutable = 'git') {}
+
 	private async runGit(repositoryPath: string, args: string[]): Promise<string> {
 		try {
-			const { stdout } = await execFileAsync('git', args, {
+			const { stdout } = await execFileAsync(this.gitExecutable, args, {
 				cwd: repositoryPath,
 				encoding: 'utf8',
 				windowsHide: true,
@@ -21,18 +38,32 @@ export class GitService {
 
 			return stdout.trimEnd();
 		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+				throw new GitExecutableNotFoundError();
+			}
+
 			const gitError = error as Error & { stderr?: string; stdout?: string };
 			const details = gitError.stderr?.trim() || gitError.stdout?.trim() || gitError.message;
 			throw new Error(details || `Git command failed: git ${args.join(' ')}`);
 		}
 	}
 
-	async getRepositoryRoot(workspacePath: string): Promise<string | undefined> {
+	async getRepositoryContext(workspacePath: string): Promise<GitRepositoryContext> {
 		try {
-			return await this.runGit(workspacePath, ['rev-parse', '--show-toplevel']);
-		} catch {
-			return undefined;
+			return {
+				status: 'repository',
+				repositoryPath: await this.runGit(workspacePath, ['rev-parse', '--show-toplevel']),
+			};
+		} catch (error) {
+			return error instanceof GitExecutableNotFoundError
+				? { status: 'missingGit' }
+				: { status: 'notRepository' };
 		}
+	}
+
+	async getRepositoryRoot(workspacePath: string): Promise<string | undefined> {
+		const context = await this.getRepositoryContext(workspacePath);
+		return context.status === 'repository' ? context.repositoryPath : undefined;
 	}
 
 	async getGitDirectory(repositoryPath: string): Promise<string> {
@@ -107,6 +138,14 @@ export class GitService {
 
 	async validatePatch(repositoryPath: string, patchPath: string): Promise<void> {
 		await this.runGit(repositoryPath, ['apply', '--stat', '--', patchPath]);
+	}
+
+	async getPatchNumStat(repositoryPath: string, patchPath: string): Promise<string> {
+		return this.runGit(repositoryPath, ['apply', '--numstat', '--', patchPath]);
+	}
+
+	async getPatchSummary(repositoryPath: string, patchPath: string): Promise<string> {
+		return this.runGit(repositoryPath, ['apply', '--summary', '--', patchPath]);
 	}
 
 	async checkPatch(repositoryPath: string, patchPath: string): Promise<void> {

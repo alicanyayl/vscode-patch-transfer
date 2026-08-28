@@ -6,6 +6,7 @@ import { PatchFile, PatchService, PatchStatus } from './patchService';
 interface PatchPresentation {
 	description: string;
 	icon: vscode.ThemeIcon;
+	statusDetail?: string;
 }
 
 export class PatchTreeItem extends vscode.TreeItem {
@@ -19,6 +20,7 @@ export class PatchTreeItem extends vscode.TreeItem {
 		this.tooltip = [
 			patch.path,
 			`Status: ${presentation.description}`,
+			presentation.statusDetail,
 			patch.sha256 ? `SHA-256: ${patch.sha256}` : undefined,
 			patch.error ? `Git: ${patch.error}` : undefined,
 		].filter((line): line is string => Boolean(line)).join('\n');
@@ -71,12 +73,15 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 	async refresh(): Promise<void> {
 		const generation = ++this.refreshGeneration;
 		const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-		const repositoryPath = workspacePath
-			? await this.gitService.getRepositoryRoot(workspacePath)
+		const repositoryContext = workspacePath
+			? await this.gitService.getRepositoryContext(workspacePath)
+			: { status: 'notRepository' as const };
+		const repositoryPath = repositoryContext.status === 'repository'
+			? repositoryContext.repositoryPath
 			: undefined;
 
 		let patches: PatchFile[] = [];
-		let state = 'noRepository';
+		let state = repositoryContext.status === 'missingGit' ? 'missingGit' : 'noRepository';
 		let refreshError: string | undefined;
 
 		if (repositoryPath) {
@@ -126,10 +131,20 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 		patches: PatchFile[],
 		refreshError?: string,
 	): vscode.TreeItem[] {
+		if (state === 'missingGit') {
+			return [
+				new MessageTreeItem(
+					'Git is required to use Patch Transfer.',
+					'Install Git and reload VS Code.',
+					new vscode.ThemeIcon('warning'),
+				),
+			];
+		}
+
 		if (state === 'noRepository') {
 			return [
 				new MessageTreeItem(
-					'Git repository not found',
+					'Open a Git repository to use Patch Transfer.',
 					undefined,
 					new vscode.ThemeIcon('warning'),
 				),
@@ -176,7 +191,7 @@ function getPatchPresentation(status: PatchStatus): PatchPresentation {
 	switch (status) {
 		case 'CREATED':
 			return {
-				description: 'Created',
+				description: 'CREATED',
 				icon: new vscode.ThemeIcon(
 					'check',
 					new vscode.ThemeColor('testing.iconPassed'),
@@ -184,12 +199,14 @@ function getPatchPresentation(status: PatchStatus): PatchPresentation {
 			};
 		case 'READY':
 			return {
-				description: 'Ready',
+				description: 'READY',
+				statusDetail: 'Ready to apply to the current project.',
 				icon: new vscode.ThemeIcon('circle-filled'),
 			};
 		case 'APPLIED':
 			return {
-				description: 'Applied',
+				description: 'APPLIED ✓',
+				statusDetail: 'This patch has already been applied.',
 				icon: new vscode.ThemeIcon(
 					'check',
 					new vscode.ThemeColor('testing.iconPassed'),
@@ -197,7 +214,7 @@ function getPatchPresentation(status: PatchStatus): PatchPresentation {
 			};
 		case 'CONFLICT':
 			return {
-				description: 'Conflict',
+				description: 'CONFLICT',
 				icon: new vscode.ThemeIcon(
 					'warning',
 					new vscode.ThemeColor('problemsWarningIcon.foreground'),
@@ -205,7 +222,7 @@ function getPatchPresentation(status: PatchStatus): PatchPresentation {
 			};
 		case 'INVALID':
 			return {
-				description: 'Invalid patch',
+				description: 'INVALID',
 				icon: new vscode.ThemeIcon(
 					'error',
 					new vscode.ThemeColor('problemsErrorIcon.foreground'),

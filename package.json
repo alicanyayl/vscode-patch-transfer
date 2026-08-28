@@ -2,7 +2,7 @@
   "name": "patch-transfer",
   "displayName": "Patch Transfer",
   "description": "offline patch transfer maneger for vs code ",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "engines": {
     "vscode": "^1.134.0"
   },
@@ -19,6 +19,8 @@
     "onCommand:patch-transfer.refreshPatches",
     "onCommand:patch-transfer.createPatch",
     "onCommand:patch-transfer.importPatch",
+    "onCommand:patch-transfer.setTransferFolder",
+    "onCommand:patch-transfer.previewPatch",
     "onCommand:patch-transfer.applyPatch",
     "onCommand:patch-transfer.showPatchError"
   ],
@@ -46,10 +48,25 @@
         "icon": "$(file-add)"
       },
       {
+        "command": "patch-transfer.setTransferFolder",
+        "title": "Set Transfer Folder",
+        "category": "Patch Transfer",
+        "icon": "$(folder-opened)"
+      },
+      {
         "command": "patch-transfer.applyPatch",
-        "title": "Apply Patch",
-        "icon": "$(check)",
+        "title": "Apply this patch to the current project",
+        "shortTitle": "Apply Patch",
+        "category": "Patch Transfer",
+        "icon": "$(play)",
         "enablement": "patchTransfer.patchReady"
+      },
+      {
+        "command": "patch-transfer.previewPatch",
+        "title": "Preview patch changes",
+        "shortTitle": "Preview Patch",
+        "category": "Patch Transfer",
+        "icon": "$(eye)"
       },
       {
         "command": "patch-transfer.showPatchError",
@@ -93,6 +110,11 @@
           "group": "navigation@2"
         },
         {
+          "command": "patch-transfer.setTransferFolder",
+          "when": "view == patch-transfer.changes",
+          "group": "navigation@3"
+        },
+        {
           "command": "patch-transfer.importPatch",
           "when": "view == patch-transfer.patches",
           "group": "navigation@1"
@@ -101,18 +123,28 @@
           "command": "patch-transfer.refreshPatches",
           "when": "view == patch-transfer.patches",
           "group": "navigation@2"
+        },
+        {
+          "command": "patch-transfer.setTransferFolder",
+          "when": "view == patch-transfer.patches",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
         {
+          "command": "patch-transfer.previewPatch",
+          "when": "view == patch-transfer.patches && (viewItem == patchTransfer.patch.ready || viewItem == patchTransfer.patch.conflict || viewItem == patchTransfer.patch.created || viewItem == patchTransfer.patch.applied)",
+          "group": "inline@1"
+        },
+        {
           "command": "patch-transfer.applyPatch",
           "when": "view == patch-transfer.patches && viewItem == patchTransfer.patch.ready",
-          "group": "inline@1"
+          "group": "inline@2"
         },
         {
           "command": "patch-transfer.showPatchError",
           "when": "view == patch-transfer.patches && viewItem == patchTransfer.patch.conflict",
-          "group": "inline@1"
+          "group": "inline@2"
         },
         {
           "command": "patch-transfer.showPatchError",

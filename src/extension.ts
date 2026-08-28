@@ -1,12 +1,20 @@
 import { relative } from 'path';
 import * as vscode from 'vscode';
+import { confirmOutOfOrderPatchApply } from './applyPatchUx';
 import { ChangesViewModel } from './changesViewModel';
 import { ChangesViewProvider } from './changesViewProvider';
 import { CommitMessageManager, CommitMessageSession } from './commitMessageManager';
 import { VsCodeGitRepositoryResolver } from './gitApi';
-import { GitService } from './gitService';
+import {
+	GitRepositoryContext,
+	GitService,
+	gitRequiredMessage,
+	repositoryRequiredMessage,
+} from './gitService';
 import { CreatePatchResult, PatchService } from './patchService';
+import { PatchPreviewProvider } from './patchPreviewProvider';
 import { PatchesTreeProvider, PatchTreeItem } from './patchesTreeProvider';
+import { TransferFolderService, TransferWorkflowService } from './transferFolderService';
 
 const ignoredWatchDirectories = new Set([
 	'.git',
@@ -19,6 +27,9 @@ const ignoredWatchDirectories = new Set([
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	const gitService = new GitService();
 	const patchService = new PatchService(gitService);
+	const patchPreviewProvider = new PatchPreviewProvider();
+	const transferFolders = new TransferFolderService(context.workspaceState);
+	const transferWorkflow = new TransferWorkflowService(transferFolders, patchService);
 	const patchesProvider = new PatchesTreeProvider(gitService, patchService);
 	const outputChannel = vscode.window.createOutputChannel('Patch Transfer');
 	const repositorySetupErrors = new Map<string, string>();
@@ -183,39 +194,58 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		outputChannel.show(true);
 	}
 
-	async function copyPatchToSelectedDirectory(patchPath: string): Promise<void> {
+	async function pickTransferFolder(openLabel: string): Promise<string | undefined> {
 		const selectedFolders = await vscode.window.showOpenDialog({
 			canSelectFiles: false,
 			canSelectFolders: true,
 			canSelectMany: false,
-			openLabel: 'Copy Patch Here',
+			openLabel,
 		});
-		const selectedFolder = selectedFolders?.[0];
-		if (!selectedFolder) {
-			return;
+		return selectedFolders?.[0]?.fsPath;
+	}
+
+	function showRepositoryRequirement(repositoryContext: GitRepositoryContext): void {
+		vscode.window.showErrorMessage(
+			repositoryContext.status === 'missingGit'
+				? gitRequiredMessage
+				: repositoryRequiredMessage,
+		);
+	}
+
+	async function getActiveRepositoryPath(): Promise<string | undefined> {
+		const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		const repositoryContext = workspacePath
+			? await gitService.getRepositoryContext(workspacePath)
+			: { status: 'notRepository' as const };
+		if (repositoryContext.status !== 'repository') {
+			showRepositoryRequirement(repositoryContext);
+			return undefined;
 		}
 
-		try {
-			const result = await patchService.copyPatchToDirectory(
-				patchPath,
-				selectedFolder.fsPath,
-			);
-			if (result.status === 'alreadyExists') {
-				vscode.window.showInformationMessage(
-					'This patch already exists in the selected folder.',
-				);
-				return;
-			}
+		return repositoryContext.repositoryPath;
+	}
 
-			vscode.window.showInformationMessage(
-				result.renamed
-					? `Patch copied as ${result.fileName}`
-					: `Patch copied to ${selectedFolder.fsPath}`,
+	function formatImportSummary(
+		importedCount: number,
+		alreadyExistsCount: number,
+		invalidCount: number,
+	): string {
+		const messages = [
+			importedCount > 0
+				? `Imported ${importedCount} patch${importedCount === 1 ? '' : 'es'}.`
+				: 'No new patches found.',
+		];
+		if (alreadyExistsCount > 0) {
+			messages.push(
+				`${alreadyExistsCount} patch${alreadyExistsCount === 1 ? '' : 'es'} already existed.`,
 			);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			vscode.window.showErrorMessage(`Patch copy failed: ${message}`);
 		}
+		if (invalidCount > 0) {
+			messages.push(
+				`${invalidCount} invalid patch${invalidCount === 1 ? '' : 'es'} skipped.`,
+			);
+		}
+		return messages.join(' ');
 	}
 
 	updateBadges();
@@ -230,6 +260,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 	context.subscriptions.push(
 		changesViewProvider,
+		patchPreviewProvider,
+		PatchPreviewProvider.register(patchPreviewProvider),
 		vscode.window.registerWebviewViewProvider(
 			'patch-transfer.changes',
 			changesViewProvider,
@@ -237,6 +269,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		...gitRepositoryListeners,
 		patchesView,
 		outputChannel,
+		vscode.commands.registerCommand('patch-transfer.setTransferFolder', async () => {
+			if (activeOperation) {
+				vscode.window.showInformationMessage(
+					'Another Patch Transfer Git operation is already running.',
+				);
+				return;
+			}
+
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
+				return;
+			}
+
+			const folderPath = await transferWorkflow.setTransferFolder(
+				repositoryPath,
+				() => pickTransferFolder('Set Transfer Folder'),
+			);
+			if (folderPath) {
+				vscode.window.showInformationMessage(`Transfer folder set: ${folderPath}`);
+			}
+		}),
 		vscode.commands.registerCommand('patch-transfer.createPatch', async () => {
 			if (activeOperation) {
 				vscode.window.showInformationMessage(
@@ -245,9 +298,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				return;
 			}
 
-			const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-			if (!workspacePath) {
-				vscode.window.showErrorMessage('Git repository not found');
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
 				return;
 			}
 
@@ -259,7 +311,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			try {
 				commitMessageSession = await changesViewProvider.beginCreatePatch();
 				if (!commitMessageSession.repositoryAvailable) {
-					vscode.window.showErrorMessage('Git repository not found');
+					vscode.window.showErrorMessage(repositoryRequiredMessage);
 					return;
 				}
 
@@ -278,7 +330,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 						title: 'Creating patch...',
 						cancellable: false,
 					},
-					() => patchService.createPatch(workspacePath, commitMessage),
+					() => patchService.createPatch(repositoryPath, commitMessage),
 				);
 
 				if (result.status === 'noChanges') {
@@ -311,17 +363,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				return;
 			}
 
-			const copyAction = createdPatch.status === 'pushFailed'
-				? await vscode.window.showErrorMessage(
-					`Patch created: ${createdPatch.patchName}\nCommit succeeded, but push failed: ${createdPatch.error}`,
-					'Copy To...',
-				)
-				: await vscode.window.showInformationMessage(
-					`Patch created: ${createdPatch.patchName}\nCommit and push completed.`,
-					'Copy To...',
+			let transferMessage = '';
+			try {
+				const transferResult = await transferWorkflow.transferCreatedPatch(
+					repositoryPath,
+					createdPatch.patchPath,
+					() => pickTransferFolder('Use as Transfer Folder'),
 				);
-			if (copyAction === 'Copy To...') {
-				await copyPatchToSelectedDirectory(createdPatch.patchPath);
+				if (transferResult.status === 'alreadyExists') {
+					transferMessage = '\nPatch already exists in the transfer folder.';
+				} else if (transferResult.status === 'copied') {
+					transferMessage = transferResult.renamed
+						? `\nCopied to the transfer folder as ${transferResult.fileName}.`
+						: '\nCopied to the transfer folder.';
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(
+					`Patch created, but automatic transfer failed: ${message}`,
+				);
+			}
+
+			if (createdPatch.status === 'pushFailed') {
+				vscode.window.showErrorMessage(
+					`Patch created: ${createdPatch.patchName}\nCommit succeeded, but push failed: ${createdPatch.error}${transferMessage}`,
+				);
+			} else {
+				vscode.window.showInformationMessage(
+					`Patch created: ${createdPatch.patchName}\nCommit and push completed.${transferMessage}`,
+				);
 			}
 		}),
 		vscode.commands.registerCommand('patch-transfer.importPatch', async () => {
@@ -332,50 +402,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				return;
 			}
 
-			const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-			if (!workspacePath) {
-				vscode.window.showErrorMessage('Git repository not found');
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
 				return;
 			}
 
 			setActiveOperation('importing');
 			try {
-				const selectedFiles = await vscode.window.showOpenDialog({
-					canSelectFiles: true,
-					canSelectFolders: false,
-					canSelectMany: false,
-					openLabel: 'Import Patch',
-					filters: { 'Patch files': ['patch'] },
-				});
-				const selectedFile = selectedFiles?.[0];
-				if (!selectedFile) {
+				const folderImport = await vscode.window.withProgress(
+					{
+						location: vscode.ProgressLocation.Notification,
+						title: 'Importing patches from transfer folder...',
+						cancellable: false,
+					},
+					() => transferWorkflow.importAvailablePatches(
+						repositoryPath,
+						() => pickTransferFolder('Use as Transfer Folder'),
+					),
+				);
+				if (folderImport.status === 'cancelled') {
 					return;
 				}
 
-				const result = await vscode.window.withProgress(
-					{
-						location: vscode.ProgressLocation.Notification,
-						title: `Importing patch: ${selectedFile.path.split('/').pop() ?? selectedFile.path}`,
-						cancellable: false,
-					},
-					() => patchService.importPatch(workspacePath, selectedFile.fsPath),
+				await refreshPatches();
+				for (const invalidPatch of folderImport.result.invalid) {
+					outputChannel.appendLine(
+						`[Import Patch] ${invalidPatch.patchName}: ${invalidPatch.error}`,
+					);
+				}
+				const summary = formatImportSummary(
+					folderImport.result.imported.length,
+					folderImport.result.alreadyExists.length,
+					folderImport.result.invalid.length,
 				);
-
-				if (result.status === 'invalid') {
-					outputChannel.appendLine(`[Import Patch] ${selectedFile.fsPath}: ${result.error}`);
-					vscode.window.showErrorMessage('Invalid patch file.');
-				} else if (result.status === 'alreadyExists') {
-					await refreshPatches();
-					vscode.window.showInformationMessage(
-						'This patch already exists in the project.',
-					);
+				if (folderImport.result.invalid.length > 0) {
+					vscode.window.showWarningMessage(summary);
 				} else {
-					await refreshPatches();
-					vscode.window.showInformationMessage(
-						result.renamed
-							? `Patch imported as ${result.patchName}`
-							: `Patch imported: ${result.patchName}`,
-					);
+					vscode.window.showInformationMessage(summary);
 				}
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -384,11 +447,51 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				setActiveOperation(undefined);
 			}
 		}),
+		vscode.commands.registerCommand('patch-transfer.previewPatch', async (argument?: unknown) => {
+			if (activeOperation) {
+				vscode.window.showInformationMessage(
+					'Another Patch Transfer Git operation is already running.',
+				);
+				return;
+			}
+
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
+				return;
+			}
+
+			const item = getSelectedPatchItem(argument);
+			const patch = item ? patchesProvider.getCurrentPatch(item.patch.path) : undefined;
+			if (!patch || patch.status === 'INVALID') {
+				vscode.window.showInformationMessage('Select a valid patch to preview.');
+				return;
+			}
+
+			try {
+				const preview = await vscode.window.withProgress(
+					{
+						location: vscode.ProgressLocation.Notification,
+						title: `Preparing patch preview: ${patch.name}`,
+						cancellable: false,
+					},
+					() => patchService.previewPatch(repositoryPath, patch.path),
+				);
+				await patchPreviewProvider.show(preview, patch.status);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Patch preview failed: ${message}`);
+			}
+		}),
 		vscode.commands.registerCommand('patch-transfer.applyPatch', async (argument?: unknown) => {
 			if (activeOperation) {
 				vscode.window.showInformationMessage(
 					'Another Patch Transfer Git operation is already running.',
 				);
+				return;
+			}
+
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
 				return;
 			}
 
@@ -408,20 +511,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				return;
 			}
 
-			const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-			if (!workspacePath) {
-				vscode.window.showErrorMessage('Git repository not found');
-				return;
-			}
-
 			setActiveOperation('applying');
 			try {
-				const repositoryPath = await gitService.getRepositoryRoot(workspacePath);
-				if (!repositoryPath) {
-					vscode.window.showErrorMessage('Git repository not found');
-					return;
-				}
-
 				const plan = await patchService.preparePatchApplication(
 					repositoryPath,
 					currentPatch.path,
@@ -441,12 +532,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				}
 
 				if (plan.olderUnappliedPatchName) {
-					const confirmation = await vscode.window.showWarningMessage(
-						`An older unapplied patch exists:\n${plan.olderUnappliedPatchName}\n\nApply ${plan.patch.name} anyway?`,
-						{ modal: true },
-						'Apply Anyway',
+					const shouldApply = await confirmOutOfOrderPatchApply(
+						plan.olderUnappliedPatchName,
+						async (message, options, ...actions) =>
+							vscode.window.showWarningMessage(message, options, ...actions),
 					);
-					if (confirmation !== 'Apply Anyway') {
+					if (!shouldApply) {
 						return;
 					}
 				}

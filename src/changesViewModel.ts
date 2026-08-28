@@ -1,7 +1,7 @@
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'path';
 import { GitChange, GitService } from './gitService';
 
-export type ChangesViewState = 'noRepository' | 'clean' | 'changes';
+export type ChangesViewState = 'missingGit' | 'noRepository' | 'clean' | 'changes';
 export type ChangeStatusCode = 'M' | 'A' | 'D' | 'R' | '?' | 'U';
 
 export interface ChangeRow {
@@ -42,14 +42,19 @@ export class ChangesViewModel {
 	async refresh(): Promise<boolean> {
 		const generation = ++this.refreshGeneration;
 		const workspacePath = this.getWorkspacePath();
-		const repositoryPath = workspacePath
-			? await this.gitService.getRepositoryRoot(workspacePath)
+		const repositoryContext = workspacePath
+			? await this.gitService.getRepositoryContext(workspacePath)
+			: { status: 'notRepository' as const };
+		const repositoryPath = repositoryContext.status === 'repository'
+			? repositoryContext.repositoryPath
 			: undefined;
 		const gitChanges = repositoryPath
 			? await this.gitService.getChanges(repositoryPath)
 			: undefined;
-		const state: ChangesViewState = !repositoryPath || !gitChanges
-			? 'noRepository'
+		const state: ChangesViewState = repositoryContext.status === 'missingGit'
+			? 'missingGit'
+			: !repositoryPath || !gitChanges
+				? 'noRepository'
 			: gitChanges.length === 0
 				? 'clean'
 				: 'changes';

@@ -8,10 +8,12 @@ Patch Transfer is a VS Code extension for transferring Git-based code changes be
 - Write or generate a commit message
 - Create timestamped patch files
 - Automatically commit and push source changes
-- Copy patches to external folders or USB drives
-- Import patches into another repository
+- Remember a repository-specific transfer folder
+- Automatically copy patches to external folders or USB drives
+- Import available patches from the remembered transfer folder
 - Detect duplicate patches using SHA-256
 - Show patch status as Created, Ready, Applied, Conflict, or Invalid
+- Preview affected files and line statistics without modifying the project
 - Apply patches safely without requiring matching Git histories
 - Keep `.patch-transfer/` local through Git `info/exclude`
 
@@ -28,14 +30,17 @@ Source repository:
 1. Edit files.
 2. Enter or generate a commit message.
 3. Select **Create Patch**.
-4. Optionally select **Copy To...** and copy the patch to a USB drive.
+4. On first use, select a transfer folder. Future patches are copied there automatically.
 
 Destination repository:
 
-1. Select **Import Patch**.
-2. Choose the patch file.
-3. Confirm the patch is **Ready**.
-4. Select **Apply Patch**.
+1. Select **Import Patch** and choose a transfer folder on first use.
+2. Future imports scan that remembered folder automatically.
+3. Confirm an imported patch is **Ready**.
+4. Select **Preview Patch** to inspect affected files and line statistics.
+5. Select **Apply Patch** to modify the destination project.
+
+Use **Set Transfer Folder** from either view title to change the remembered folder.
 
 Patch files are stored locally under:
 

@@ -175,7 +175,11 @@ export class ChangesViewProvider implements vscode.WebviewViewProvider, vscode.D
 					break;
 				case 'noRepository':
 					this.postCommitSnapshot({ repositoryAvailable: false, message: '' });
-					void vscode.window.showInformationMessage('Git repository not found');
+					void vscode.window.showInformationMessage(
+						this.changesModel.snapshot.state === 'missingGit'
+							? 'Git is required to use Patch Transfer. Install Git and reload VS Code.'
+							: 'Open a Git repository to use Patch Transfer.',
+					);
 					break;
 			}
 		} catch (error) {
@@ -305,8 +309,13 @@ export class ChangesViewProvider implements vscode.WebviewViewProvider, vscode.D
 		function renderChanges(state, changes) {
 			changesContainer.replaceChildren();
 			hasChanges = state === 'changes' && Array.isArray(changes) && changes.length > 0;
-			if (state === 'noRepository') {
-				appendEmptyState('Git repository not found', '');
+			if (state === 'missingGit') {
+				appendEmptyState(
+					'Git is required to use Patch Transfer.',
+					'Install Git and reload VS Code.',
+				);
+			} else if (state === 'noRepository') {
+				appendEmptyState('Open a Git repository to use Patch Transfer.', '');
 			} else if (!hasChanges) {
 				appendEmptyState('Working tree clean', 'No changes to create a patch');
 			} else {

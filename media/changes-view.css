@@ -142,16 +142,17 @@ button:disabled {
 	display: flex;
 	flex-direction: column;
 	min-width: 0;
-	margin: 2px -8px 0;
+	margin: 4px -8px 0;
 }
 
 .change-row {
 	display: grid;
-	grid-template-columns: minmax(90px, auto) minmax(0, 1fr) 20px;
+	grid-template-columns: minmax(100px, max-content) minmax(0, 1fr) 24px;
+	column-gap: 10px;
 	align-items: center;
-	min-height: 22px;
+	min-height: 26px;
 	width: 100%;
-	padding: 2px 8px;
+	padding: 3px 10px;
 	border: 0;
 	text-align: left;
 	color: var(--vscode-foreground);
@@ -164,18 +165,24 @@ button.change-row:hover {
 
 .file-name,
 .parent-path {
+	min-width: 0;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
 
+.file-name {
+	max-width: min(42vw, 240px);
+}
+
 .parent-path {
-	padding-left: 8px;
 	color: var(--vscode-descriptionForeground);
 }
 
 .change-status {
 	justify-self: end;
+	min-width: 16px;
+	text-align: right;
 	font-weight: 600;
 }
 

@@ -19,6 +19,12 @@ export type ImportPatchResult =
 	| { status: 'invalid'; error: string }
 	| { status: 'alreadyExists'; patchName: string; patchPath: string };
 
+export interface ImportPatchesResult {
+	imported: Array<{ patchName: string; patchPath: string; renamed: boolean }>;
+	alreadyExists: Array<{ patchName: string; patchPath: string }>;
+	invalid: Array<{ patchName: string; error: string }>;
+}
+
 export type PatchStatus = 'CREATED' | 'READY' | 'APPLIED' | 'CONFLICT' | 'INVALID';
 
 export interface PatchFile {
@@ -35,6 +41,21 @@ export interface PatchApplicationPlan {
 	olderUnappliedPatchName?: string;
 }
 
+export type PatchPreviewChangeType = 'Modified' | 'Added' | 'Deleted' | 'Renamed';
+
+export interface PatchPreviewFile {
+	path: string;
+	originalPath?: string;
+	changeType: PatchPreviewChangeType;
+	additions?: number;
+	deletions?: number;
+}
+
+export interface PatchPreview {
+	patchName: string;
+	files: PatchPreviewFile[];
+}
+
 export type ApplyPatchResult =
 	| { status: 'applied'; patchName: string }
 	| { status: 'alreadyApplied'; patchName: string }
@@ -47,6 +68,12 @@ interface PatchCandidate {
 	name: string;
 	path: string;
 	timestamp: Date;
+}
+
+interface PatchSummaryEntry {
+	path: string;
+	originalPath?: string;
+	changeType: Exclude<PatchPreviewChangeType, 'Modified'>;
 }
 
 type TransferPatchResult =
@@ -143,6 +170,46 @@ export class PatchService {
 		};
 	}
 
+	async importPatchesFromDirectory(
+		workspacePath: string,
+		transferDirectory: string,
+	): Promise<ImportPatchesResult> {
+		const entries = await readdir(transferDirectory, { withFileTypes: true });
+		const patchNames = entries
+			.filter(entry => entry.isFile() && extname(entry.name).toLowerCase() === '.patch')
+			.map(entry => entry.name)
+			.sort((left, right) => left.localeCompare(right));
+		const result: ImportPatchesResult = {
+			imported: [],
+			alreadyExists: [],
+			invalid: [],
+		};
+
+		for (const patchName of patchNames) {
+			try {
+				const importResult = await this.importPatch(
+					workspacePath,
+					join(transferDirectory, patchName),
+				);
+				switch (importResult.status) {
+					case 'imported':
+						result.imported.push(importResult);
+						break;
+					case 'alreadyExists':
+						result.alreadyExists.push(importResult);
+						break;
+					case 'invalid':
+						result.invalid.push({ patchName, error: importResult.error });
+						break;
+				}
+			} catch (error) {
+				result.invalid.push({ patchName, error: this.getErrorMessage(error) });
+			}
+		}
+
+		return result;
+	}
+
 	async createPatch(workspacePath: string, commitMessage: string): Promise<CreatePatchResult> {
 		const normalizedCommitMessage = commitMessage.trim();
 		if (!normalizedCommitMessage) {
@@ -221,6 +288,18 @@ export class PatchService {
 		);
 
 		return patches.sort((left, right) => this.compareNewestFirst(left, right));
+	}
+
+	async previewPatch(repositoryPath: string, patchPath: string): Promise<PatchPreview> {
+		const safePatchPath = this.validatePatchPath(repositoryPath, patchPath);
+		const [numStat, summary] = await Promise.all([
+			this.gitService.getPatchNumStat(repositoryPath, safePatchPath),
+			this.gitService.getPatchSummary(repositoryPath, safePatchPath),
+		]);
+		const files = this.parsePatchNumStat(numStat);
+		this.applyPatchSummary(files, this.parsePatchSummary(summary));
+
+		return { patchName: basename(safePatchPath), files };
 	}
 
 	async preparePatchApplication(
@@ -373,6 +452,100 @@ export class PatchService {
 				}
 			}
 		}
+	}
+
+	private parsePatchNumStat(output: string): PatchPreviewFile[] {
+		return output
+			.split(/\r?\n/)
+			.filter(line => line.length > 0)
+			.map(line => {
+				const [added, deleted, ...pathParts] = line.split('\t');
+				if (!added || !deleted || pathParts.length === 0) {
+					throw new Error(`Could not parse patch statistics: ${line}`);
+				}
+
+				return {
+					path: pathParts.join('\t'),
+					changeType: 'Modified' as const,
+					additions: this.parsePatchLineCount(added),
+					deletions: this.parsePatchLineCount(deleted),
+				};
+			});
+	}
+
+	private parsePatchSummary(output: string): PatchSummaryEntry[] {
+		const entries: PatchSummaryEntry[] = [];
+		let renameFrom: string | undefined;
+
+		for (const rawLine of output.split(/\r?\n/)) {
+			const line = rawLine.trim();
+			let match = /^create mode \d+ (.+)$/.exec(line);
+			if (match) {
+				entries.push({ path: match[1], changeType: 'Added' });
+				continue;
+			}
+
+			match = /^delete mode \d+ (.+)$/.exec(line);
+			if (match) {
+				entries.push({ path: match[1], changeType: 'Deleted' });
+				continue;
+			}
+
+			match = /^rename (.+) => (.+) \(\d+%\)$/.exec(line);
+			if (match) {
+				entries.push({
+					path: match[2],
+					originalPath: match[1],
+					changeType: 'Renamed',
+				});
+				continue;
+			}
+
+			match = /^rename from (.+)$/.exec(line);
+			if (match) {
+				renameFrom = match[1];
+				continue;
+			}
+
+			match = /^rename to (.+)$/.exec(line);
+			if (match && renameFrom) {
+				entries.push({
+					path: match[1],
+					originalPath: renameFrom,
+					changeType: 'Renamed',
+				});
+				renameFrom = undefined;
+			}
+		}
+
+		return entries;
+	}
+
+	private applyPatchSummary(
+		files: PatchPreviewFile[],
+		summaryEntries: PatchSummaryEntry[],
+	): void {
+		for (const summary of summaryEntries) {
+			const file = files.find(candidate =>
+				candidate.path === summary.path ||
+				(summary.changeType === 'Renamed' &&
+					candidate.changeType === 'Modified' &&
+					(candidate.path.includes('=>') ||
+						candidate.path.includes(summary.path) ||
+						candidate.path.includes(summary.originalPath ?? '\0'))),
+			);
+			if (file) {
+				file.path = summary.path;
+				file.originalPath = summary.originalPath;
+				file.changeType = summary.changeType;
+			} else {
+				files.push({ ...summary });
+			}
+		}
+	}
+
+	private parsePatchLineCount(value: string): number | undefined {
+		return /^\d+$/.test(value) ? Number(value) : undefined;
 	}
 
 	private async resolveSafePatchDestination(

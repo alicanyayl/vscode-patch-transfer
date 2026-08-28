@@ -4,6 +4,13 @@ import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'fs/p
 import { tmpdir } from 'os';
 import { dirname, join, resolve } from 'path';
 import { promisify } from 'util';
+import {
+	applyAnywayAction,
+	cancelApplyAction,
+	confirmOutOfOrderPatchApply,
+	olderPatchesWarning,
+	olderPatchesWarningDetail,
+} from '../applyPatchUx';
 import { CommitMessageManager } from '../commitMessageManager';
 import { GitService } from '../gitService';
 import { PatchService } from '../patchService';
@@ -146,7 +153,7 @@ suite('Patch application workflow', function () {
 		assert.strictEqual(await readFile(join(destination, 'target.txt'), 'utf8'), 'base\n');
 	});
 
-	test('warns through the plan when an older patch is not applied', async () => {
+	test('warns clearly and requires Apply Anyway when an older patch is not applied', async () => {
 		const root = await createTemporaryDirectory();
 		const source = await createRepository(root, 'source', 'base\n', 'source base');
 		const destination = await createRepository(root, 'destination', 'base\n', 'destination base');
@@ -170,6 +177,195 @@ suite('Patch application workflow', function () {
 		const plan = await patchService.preparePatchApplication(destination, newerPatchPath);
 		assert.strictEqual(plan.patch.status, 'READY');
 		assert.strictEqual(plan.olderUnappliedPatchName, '2026-08-27_120000.patch');
+		let warningMessage = '';
+		let warningDetail = '';
+		let warningActions: string[] = [];
+		const cancelled = await confirmOutOfOrderPatchApply(
+			plan.olderUnappliedPatchName ?? '',
+			async (message, options, ...actions) => {
+				warningMessage = message;
+				warningDetail = options.detail;
+				warningActions = actions;
+				return cancelApplyAction;
+			},
+		);
+		assert.strictEqual(cancelled, false);
+		assert.strictEqual(warningMessage, olderPatchesWarning);
+		assert.ok(warningDetail.includes(olderPatchesWarningDetail));
+		assert.ok(warningDetail.includes('2026-08-27_120000.patch'));
+		assert.deepStrictEqual(warningActions, [applyAnywayAction, cancelApplyAction]);
+		assert.strictEqual(await readFile(join(destination, 'target.txt'), 'utf8'), 'base\n');
+
+		const confirmed = await confirmOutOfOrderPatchApply(
+			plan.olderUnappliedPatchName ?? '',
+			async () => applyAnywayAction,
+		);
+		assert.strictEqual(confirmed, true);
+		assert.strictEqual((await patchService.applyPatch(destination, newerPatchPath)).status, 'applied');
+		assert.strictEqual(await readFile(join(destination, 'target.txt'), 'utf8'), 'newer\n');
+	});
+
+	test('previews READY patch paths, change types, and line statistics without mutation', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'preview-source', 'base\n', 'source history');
+		const destination = await createRepository(
+			root,
+			'preview-destination',
+			'base\n',
+			'independent destination history',
+		);
+		for (const repository of [source, destination]) {
+			await writeFile(join(repository, 'deleted.txt'), 'remove me\n', 'utf8');
+			await writeFile(join(repository, 'renamed-old.txt'), 'rename me\n', 'utf8');
+			await runGit(repository, ['add', '.']);
+			await runGit(repository, ['commit', '--quiet', '-m', 'preview baseline']);
+		}
+		await writeFile(join(source, 'target.txt'), 'modified\n', 'utf8');
+		await writeFile(join(source, 'added.txt'), 'one\ntwo\n', 'utf8');
+		await rm(join(source, 'deleted.txt'));
+		await runGit(source, ['mv', 'renamed-old.txt', 'renamed-new.txt']);
+		await runGit(source, ['add', '--all']);
+		const patchDirectory = join(destination, '.patch-transfer');
+		const patchPath = join(patchDirectory, 'preview.patch');
+		await mkdir(patchDirectory, { recursive: true });
+		await runGit(source, [
+			'diff',
+			'--cached',
+			'--binary',
+			'--full-index',
+			'--no-color',
+			'-M',
+			'HEAD',
+			`--output=${patchPath}`,
+		]);
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const statePath = await new PatchStateService(gitService).getStatePath(destination);
+		const statusBefore = await runGit(destination, ['status', '--porcelain']);
+		const contentsBefore = await readFile(join(destination, 'target.txt'), 'utf8');
+		assert.strictEqual((await patchService.listPatches(destination))[0].status, 'READY');
+
+		const preview = await patchService.previewPatch(destination, patchPath);
+		const files = new Map(preview.files.map(file => [file.path, file]));
+		assert.strictEqual(preview.patchName, 'preview.patch');
+		assert.deepStrictEqual(
+			{
+				type: files.get('target.txt')?.changeType,
+				additions: files.get('target.txt')?.additions,
+				deletions: files.get('target.txt')?.deletions,
+			},
+			{ type: 'Modified', additions: 1, deletions: 1 },
+		);
+		assert.strictEqual(files.get('added.txt')?.changeType, 'Added');
+		assert.strictEqual(files.get('added.txt')?.additions, 2);
+		assert.strictEqual(files.get('deleted.txt')?.changeType, 'Deleted');
+		assert.strictEqual(files.get('deleted.txt')?.deletions, 1);
+		assert.strictEqual(files.get('renamed-new.txt')?.changeType, 'Renamed');
+		assert.strictEqual(files.get('renamed-new.txt')?.originalPath, 'renamed-old.txt');
+		assert.strictEqual(await runGit(destination, ['status', '--porcelain']), statusBefore);
+		assert.strictEqual(await readFile(join(destination, 'target.txt'), 'utf8'), contentsBefore);
+		await assert.rejects(() => readFile(statePath), { code: 'ENOENT' });
+	});
+
+	test('previews APPLIED patches without changing working tree or state', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'applied-preview-source', 'base\n', 'source history');
+		const destination = await createRepository(
+			root,
+			'applied-preview-destination',
+			'base\n',
+			'destination history',
+		);
+		const patchPath = await createPatch(
+			source,
+			destination,
+			'applied-preview.patch',
+			'applied preview\n',
+		);
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		assert.strictEqual((await patchService.applyPatch(destination, patchPath)).status, 'applied');
+		assert.strictEqual((await patchService.listPatches(destination))[0].status, 'APPLIED');
+		const statePath = await new PatchStateService(gitService).getStatePath(destination);
+		const stateBefore = await readFile(statePath, 'utf8');
+		const statusBefore = await runGit(destination, ['status', '--porcelain']);
+		const contentsBefore = await readFile(join(destination, 'target.txt'), 'utf8');
+
+		const preview = await patchService.previewPatch(destination, patchPath);
+		assert.strictEqual(preview.files[0].path, 'target.txt');
+		assert.strictEqual(await readFile(statePath, 'utf8'), stateBefore);
+		assert.strictEqual(await runGit(destination, ['status', '--porcelain']), statusBefore);
+		assert.strictEqual(await readFile(join(destination, 'target.txt'), 'utf8'), contentsBefore);
+	});
+
+	test('previews CREATED patches without changing source state', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'created-preview', 'base\n', 'source history');
+		await writeFile(join(repository, 'target.txt'), 'created preview\n', 'utf8');
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const result = await patchService.createPatch(repository, 'feat: preview created patch');
+		assert.strictEqual(result.status, 'pushFailed');
+		if (result.status !== 'pushFailed') {
+			assert.fail('Expected the repository without a remote to report pushFailed.');
+		}
+		assert.strictEqual((await patchService.listPatches(repository))[0].status, 'CREATED');
+		const statePath = await new PatchStateService(gitService).getStatePath(repository);
+		const stateBefore = await readFile(statePath, 'utf8');
+		const statusBefore = await runGit(repository, ['status', '--porcelain']);
+
+		const preview = await patchService.previewPatch(repository, result.patchPath);
+		assert.strictEqual(preview.files[0].path, 'target.txt');
+		assert.strictEqual(await readFile(statePath, 'utf8'), stateBefore);
+		assert.strictEqual(await runGit(repository, ['status', '--porcelain']), statusBefore);
+	});
+
+	test('previews valid CONFLICT patches without bypassing conflict safety', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'conflict-preview-source', 'base\n', 'source history');
+		const destination = await createRepository(
+			root,
+			'conflict-preview-destination',
+			'base\n',
+			'destination history',
+		);
+		const patchPath = await createPatch(
+			source,
+			destination,
+			'conflict-preview.patch',
+			'patch change\n',
+		);
+		await writeFile(join(destination, 'target.txt'), 'local conflict\n', 'utf8');
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		assert.strictEqual((await patchService.listPatches(destination))[0].status, 'CONFLICT');
+		const statusBefore = await runGit(destination, ['status', '--porcelain']);
+
+		const preview = await patchService.previewPatch(destination, patchPath);
+		assert.strictEqual(preview.files[0].path, 'target.txt');
+		assert.strictEqual(await runGit(destination, ['status', '--porcelain']), statusBefore);
+		assert.strictEqual(
+			await readFile(join(destination, 'target.txt'), 'utf8'),
+			'local conflict\n',
+		);
+	});
+
+	test('fails invalid patch preview gracefully without changing files or state', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'invalid-preview', 'base\n', 'history');
+		const patchDirectory = join(repository, '.patch-transfer');
+		const patchPath = join(patchDirectory, 'invalid.patch');
+		await mkdir(patchDirectory, { recursive: true });
+		await writeFile(patchPath, 'not a patch\n', 'utf8');
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const statePath = await new PatchStateService(gitService).getStatePath(repository);
+		const statusBefore = await runGit(repository, ['status', '--porcelain']);
+
+		await assert.rejects(() => patchService.previewPatch(repository, patchPath));
+		assert.strictEqual(await runGit(repository, ['status', '--porcelain']), statusBefore);
+		assert.strictEqual(await readFile(join(repository, 'target.txt'), 'utf8'), 'base\n');
+		await assert.rejects(() => readFile(statePath), { code: 'ENOENT' });
 	});
 
 	test('uses the exact manual message, records CREATED, commits, pushes, and clears', async () => {
