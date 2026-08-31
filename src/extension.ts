@@ -11,9 +11,17 @@ import {
 	gitRequiredMessage,
 	repositoryRequiredMessage,
 } from './gitService';
+import { AuditHistoryService } from './auditHistoryService';
+import { ConflictPreviewProvider } from './conflictPreviewProvider';
+import { formatConflictClipboardReport } from './conflictDiagnostics';
+import { HistoryPreviewProvider } from './historyPreviewProvider';
+import { PatchDetailsPreviewProvider } from './patchDetailsPreviewProvider';
+import { PatchMetadataService } from './patchMetadataService';
 import { CreatePatchResult, PatchService } from './patchService';
 import { PatchPreviewProvider } from './patchPreviewProvider';
 import { PatchesTreeProvider, PatchTreeItem } from './patchesTreeProvider';
+import { PatchStateService } from './patchStateService';
+import { RollbackService } from './rollbackService';
 import { TransferFolderService, TransferWorkflowService } from './transferFolderService';
 
 const ignoredWatchDirectories = new Set([
@@ -26,11 +34,31 @@ const ignoredWatchDirectories = new Set([
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	const gitService = new GitService();
-	const patchService = new PatchService(gitService);
+	const stateService = new PatchStateService(gitService);
+	const auditHistoryService = new AuditHistoryService(gitService);
+	const metadataService = new PatchMetadataService(gitService);
+	const patchService = new PatchService(
+		gitService,
+		stateService,
+		undefined,
+		metadataService,
+		auditHistoryService,
+	);
+	const rollbackService = new RollbackService(gitService);
+	const patchServiceWithRollback = new PatchService(
+		gitService,
+		stateService,
+		rollbackService,
+		metadataService,
+		auditHistoryService,
+	);
 	const patchPreviewProvider = new PatchPreviewProvider();
+	const conflictPreviewProvider = new ConflictPreviewProvider();
+	const historyPreviewProvider = new HistoryPreviewProvider(auditHistoryService);
+	const patchDetailsPreviewProvider = new PatchDetailsPreviewProvider();
 	const transferFolders = new TransferFolderService(context.workspaceState);
 	const transferWorkflow = new TransferWorkflowService(transferFolders, patchService);
-	const patchesProvider = new PatchesTreeProvider(gitService, patchService);
+	const patchesProvider = new PatchesTreeProvider(gitService, patchService, stateService, rollbackService);
 	const outputChannel = vscode.window.createOutputChannel('Patch Transfer');
 	const repositorySetupErrors = new Map<string, string>();
 	const gitRepositoryResolver = new VsCodeGitRepositoryResolver();
@@ -95,13 +123,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	});
 	const fileWatcher = vscode.workspace.createFileSystemWatcher('**/*');
 	const patchWatcher = vscode.workspace.createFileSystemWatcher('**/.patch-transfer/*.patch');
-	let activeOperation: 'creating' | 'applying' | 'importing' | undefined;
+	let activeOperation: 'creating' | 'applying' | 'importing' | 'undoing' | undefined;
 	let changesRefreshTimer: NodeJS.Timeout | undefined;
 	let patchesRefreshTimer: NodeJS.Timeout | undefined;
 	let lastPatchRefreshError: string | undefined;
 
 	const setActiveOperation = (
-		operation: 'creating' | 'applying' | 'importing' | undefined,
+		operation: 'creating' | 'applying' | 'importing' | 'undoing' | undefined,
 	) => {
 		activeOperation = operation;
 		changesViewProvider.setOperationBusy(operation !== undefined);
@@ -194,6 +222,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		outputChannel.show(true);
 	}
 
+	async function openConflictDetailsForPatch(
+		repositoryPath: string,
+		patchPath: string,
+	): Promise<void> {
+		try {
+			const diagnostic = await vscode.window.withProgress(
+				{
+					location: vscode.ProgressLocation.Notification,
+					title: 'Diagnosing patch conflicts...',
+					cancellable: false,
+				},
+				() => patchService.getConflictDiagnostics(repositoryPath, patchPath),
+			);
+			await conflictPreviewProvider.show(diagnostic);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			vscode.window.showErrorMessage(`Conflict diagnosis failed: ${message}`);
+		}
+	}
+
 	async function pickTransferFolder(openLabel: string): Promise<string | undefined> {
 		const selectedFolders = await vscode.window.showOpenDialog({
 			canSelectFiles: false,
@@ -261,7 +309,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(
 		changesViewProvider,
 		patchPreviewProvider,
+		conflictPreviewProvider,
+		historyPreviewProvider,
+		patchDetailsPreviewProvider,
 		PatchPreviewProvider.register(patchPreviewProvider),
+		ConflictPreviewProvider.register(conflictPreviewProvider),
+		HistoryPreviewProvider.register(historyPreviewProvider),
+		PatchDetailsPreviewProvider.register(patchDetailsPreviewProvider),
 		vscode.window.registerWebviewViewProvider(
 			'patch-transfer.changes',
 			changesViewProvider,
@@ -542,13 +596,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 					}
 				}
 
+				if (plan.missingPredecessorSha) {
+					const selection = await vscode.window.showWarningMessage(
+						'A previous patch in this transfer chain is missing.\n\nApplying this patch without its predecessor may produce an incomplete project state.',
+						{ modal: true },
+						'Apply Anyway',
+						'Cancel',
+					);
+					if (selection !== 'Apply Anyway') {
+						return;
+					}
+				}
+
 				const result = await vscode.window.withProgress(
 					{
 						location: vscode.ProgressLocation.Notification,
 						title: `Applying patch: ${plan.patch.name}`,
 						cancellable: false,
 					},
-					() => patchService.applyPatch(repositoryPath, plan.patch.path),
+					() => patchServiceWithRollback.applyPatch(repositoryPath, plan.patch.path),
 				);
 
 				switch (result.status) {
@@ -563,16 +629,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 							'Patches created in this repository cannot be applied here.',
 						);
 						break;
-					case 'notReady':
+					case 'notReady': {
 						showPatchError(result.patchName, result.patchStatus, result.error);
-						vscode.window.showErrorMessage(
+						const actions = result.patchStatus === 'CONFLICT' ? ['Show Details'] : [];
+						const selection = await vscode.window.showErrorMessage(
 							`Patch is ${result.patchStatus.toLowerCase()}: ${result.patchName}`,
+							...actions,
 						);
+						if (selection === 'Show Details') {
+							await openConflictDetailsForPatch(repositoryPath, plan.patch.path);
+						}
 						break;
-					case 'applyFailed':
+					}
+					case 'applyFailed': {
 						showPatchError(result.patchName, 'APPLY FAILED', result.error);
-						vscode.window.showErrorMessage(`Patch application failed: ${result.error}`);
+						const selection = await vscode.window.showErrorMessage(
+							`Patch application failed: ${result.error}`,
+							'Show Details',
+						);
+						if (selection === 'Show Details') {
+							await openConflictDetailsForPatch(repositoryPath, plan.patch.path);
+						}
 						break;
+					}
 					case 'stateSaveFailed':
 						showPatchError(result.patchName, 'STATE SAVE FAILED', result.error);
 						vscode.window.showErrorMessage(
@@ -601,6 +680,163 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			}
 
 			showPatchError(patch.name, patch.status, patch.error);
+		}),
+		vscode.commands.registerCommand('patch-transfer.showConflictDetails', async (argument?: unknown) => {
+			if (activeOperation) {
+				vscode.window.showInformationMessage(
+					'Another Patch Transfer Git operation is already running.',
+				);
+				return;
+			}
+
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
+				return;
+			}
+
+			const item = getSelectedPatchItem(argument);
+			const patch = item ? patchesProvider.getCurrentPatch(item.patch.path) : undefined;
+			if (!patch || patch.status !== 'CONFLICT') {
+				vscode.window.showInformationMessage('Select a conflicting patch to view conflict details.');
+				return;
+			}
+
+			await openConflictDetailsForPatch(repositoryPath, patch.path);
+		}),
+		vscode.commands.registerCommand('patch-transfer.copyConflictDiagnostics', async (argument?: unknown) => {
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
+				return;
+			}
+
+			const item = getSelectedPatchItem(argument);
+			const patch = item ? patchesProvider.getCurrentPatch(item.patch.path) : undefined;
+			if (!patch || patch.status !== 'CONFLICT') {
+				vscode.window.showInformationMessage('Select a conflicting patch to copy conflict diagnostics.');
+				return;
+			}
+
+			try {
+				const diagnostic = await patchService.getConflictDiagnostics(repositoryPath, patch.path);
+				const report = formatConflictClipboardReport(diagnostic);
+				await vscode.env.clipboard.writeText(report);
+				vscode.window.showInformationMessage('Conflict diagnostics copied to clipboard.');
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Could not copy conflict diagnostics: ${message}`);
+			}
+		}),
+		vscode.commands.registerCommand('patch-transfer.undoLastPatch', async () => {
+			if (activeOperation) {
+				vscode.window.showInformationMessage(
+					'Another Patch Transfer Git operation is already running.',
+				);
+				return;
+			}
+
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
+				return;
+			}
+
+			setActiveOperation('undoing');
+			try {
+				const latestSha = await stateService.getLatestAppliedSha(repositoryPath);
+				if (!latestSha) {
+					vscode.window.showInformationMessage('No applied patch is available to undo.');
+					return;
+				}
+
+				const hasSnapshot = await rollbackService.hasSnapshot(repositoryPath, latestSha);
+				if (!hasSnapshot) {
+					vscode.window.showErrorMessage('Rollback data for this patch is unavailable.');
+					return;
+				}
+
+				const mismatches = await rollbackService.checkFingerprints(repositoryPath, latestSha);
+				if (mismatches.length > 0) {
+					const fileCount = mismatches.length;
+					const fileLabel = fileCount === 1 ? '1 file' : `${fileCount} files`;
+					const selection = await vscode.window.showWarningMessage(
+						`${fileLabel} changed after this patch was applied.`,
+						{
+							modal: true,
+							detail: 'Undoing the patch may overwrite newer local changes.',
+						},
+						'Undo Anyway',
+						'Cancel',
+					);
+
+					if (selection !== 'Undo Anyway') {
+						return;
+					}
+				}
+
+				const state = await stateService.load(repositoryPath);
+				const patchFileName = state.applied[latestSha]?.fileName ?? `${latestSha}.patch`;
+
+				await vscode.window.withProgress(
+					{
+						location: vscode.ProgressLocation.Notification,
+						title: 'Undoing last applied patch...',
+						cancellable: false,
+					},
+					async () => {
+						await rollbackService.restoreSnapshot(repositoryPath, latestSha);
+						await stateService.removeApplied(repositoryPath, latestSha);
+						await rollbackService.deleteSnapshot(repositoryPath, latestSha);
+						await auditHistoryService.recordEvent(repositoryPath, {
+							timestamp: new Date().toISOString(),
+							event: 'UNDONE',
+							patchSha256: latestSha,
+							patchFileName,
+						});
+					},
+				);
+
+				vscode.window.showInformationMessage('Last applied patch has been undone.');
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				outputChannel.appendLine(`[Undo Patch] ${message}`);
+				vscode.window.showErrorMessage(`Undo failed: ${message}`);
+			} finally {
+				await Promise.all([refreshChanges(), refreshPatches()]);
+				setActiveOperation(undefined);
+			}
+		}),
+		vscode.commands.registerCommand('patch-transfer.showHistory', async () => {
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
+				return;
+			}
+
+			const state = await stateService.load(repositoryPath);
+			const patches = await patchService.listPatches(repositoryPath).catch(() => []);
+			const history = await auditHistoryService.loadHistory(repositoryPath);
+			await historyPreviewProvider.show(
+				history,
+				repositoryPath.split(/[\\/]/).pop(),
+				{
+					totalPatches: patches.length,
+					currentlyApplied: Object.keys(state.applied).length,
+				},
+			);
+		}),
+		vscode.commands.registerCommand('patch-transfer.showPatchDetails', async (argument?: unknown) => {
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
+				return;
+			}
+
+			const item = getSelectedPatchItem(argument);
+			const patch = item ? patchesProvider.getCurrentPatch(item.patch.path) : undefined;
+			if (!patch) {
+				vscode.window.showInformationMessage('Select a patch to view details.');
+				return;
+			}
+
+			const details = await patchService.getPatchDetails(repositoryPath, patch.path);
+			await patchDetailsPreviewProvider.show(details);
 		}),
 		vscode.commands.registerCommand('patch-transfer.refresh', refreshChanges),
 		vscode.commands.registerCommand('patch-transfer.refreshPatches', refreshPatches),

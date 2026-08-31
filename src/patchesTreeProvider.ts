@@ -2,6 +2,8 @@ import { resolve } from 'path';
 import * as vscode from 'vscode';
 import { GitService } from './gitService';
 import { PatchFile, PatchService, PatchStatus } from './patchService';
+import { PatchStateService } from './patchStateService';
+import { RollbackService } from './rollbackService';
 
 interface PatchPresentation {
 	description: string;
@@ -10,17 +12,23 @@ interface PatchPresentation {
 }
 
 export class PatchTreeItem extends vscode.TreeItem {
-	constructor(readonly patch: PatchFile) {
+	constructor(readonly patch: PatchFile, undoable = false, gapWarning?: string) {
 		super(patch.name, vscode.TreeItemCollapsibleState.None);
 		const presentation = getPatchPresentation(patch.status);
 
-		this.description = presentation.description;
+		this.description = gapWarning
+			? `${presentation.description} ⚠`
+			: presentation.description;
 		this.iconPath = presentation.icon;
-		this.contextValue = `patchTransfer.patch.${patch.status.toLowerCase()}`;
+		this.contextValue = undoable
+			? 'patchTransfer.patch.applied.undoable'
+			: `patchTransfer.patch.${patch.status.toLowerCase()}`;
 		this.tooltip = [
 			patch.path,
 			`Status: ${presentation.description}`,
 			presentation.statusDetail,
+			gapWarning ? `⚠ ${gapWarning}` : undefined,
+			undoable ? 'Undo is available for this patch.' : undefined,
 			patch.sha256 ? `SHA-256: ${patch.sha256}` : undefined,
 			patch.error ? `Git: ${patch.error}` : undefined,
 		].filter((line): line is string => Boolean(line)).join('\n');
@@ -55,6 +63,8 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 	constructor(
 		private readonly gitService: GitService,
 		private readonly patchService: PatchService,
+		private readonly stateService?: PatchStateService,
+		private readonly rollbackService?: RollbackService,
 	) {}
 
 	get count(): number {
@@ -98,10 +108,28 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 			return;
 		}
 
+		// Determine the latest applied SHA that has a valid rollback snapshot.
+		let latestUndoableSha: string | undefined;
+		if (repositoryPath && this.stateService && this.rollbackService) {
+			try {
+				const latestSha = await this.stateService.getLatestAppliedSha(repositoryPath);
+				if (latestSha && await this.rollbackService.hasSnapshot(repositoryPath, latestSha)) {
+					latestUndoableSha = latestSha;
+				}
+			} catch {
+				// Best-effort; do not block refresh.
+			}
+		}
+
+		if (generation !== this.refreshGeneration) {
+			return;
+		}
+
 		const snapshotKey = [
 			repositoryPath ?? '',
 			state,
 			refreshError ?? '',
+			latestUndoableSha ?? '',
 			...patches.map(
 				patch => `${patch.name}\0${patch.sha256 ?? ''}\0${patch.status}\0${patch.error ?? ''}`,
 			),
@@ -114,7 +142,7 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 		this.patches = patches;
 		this.patchCount = patches.length;
 		this.refreshError = refreshError;
-		this.items = this.createItems(state, patches, refreshError);
+		this.items = this.createItems(state, patches, refreshError, latestUndoableSha);
 		this.changeEmitter.fire(undefined);
 	}
 
@@ -130,6 +158,7 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 		state: string,
 		patches: PatchFile[],
 		refreshError?: string,
+		latestUndoableSha?: string,
 	): vscode.TreeItem[] {
 		if (state === 'missingGit') {
 			return [
@@ -174,7 +203,12 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 			];
 		}
 
-		return patches.map(patch => new PatchTreeItem(patch));
+		return patches.map(patch => {
+			const undoable = patch.status === 'APPLIED' &&
+				patch.sha256 !== undefined &&
+				patch.sha256 === latestUndoableSha;
+			return new PatchTreeItem(patch, undoable);
+		});
 	}
 
 	private normalizePath(filePath: string): string {
@@ -215,6 +249,7 @@ function getPatchPresentation(status: PatchStatus): PatchPresentation {
 		case 'CONFLICT':
 			return {
 				description: 'CONFLICT',
+				statusDetail: 'This patch cannot currently be applied.\nOpen Conflict Details to see the affected files.',
 				icon: new vscode.ThemeIcon(
 					'warning',
 					new vscode.ThemeColor('problemsWarningIcon.foreground'),

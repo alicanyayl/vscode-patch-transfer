@@ -152,6 +152,29 @@ export class GitService {
 		await this.runGit(repositoryPath, ['apply', '--check', '--', patchPath]);
 	}
 
+	async getPatchCheckDiagnostics(repositoryPath: string, patchPath: string): Promise<string> {
+		try {
+			const { stdout, stderr } = await execFileAsync(
+				this.gitExecutable,
+				['apply', '--check', '--verbose', '--', patchPath],
+				{
+					cwd: repositoryPath,
+					encoding: 'utf8',
+					windowsHide: true,
+				},
+			);
+			return [stderr?.trim(), stdout?.trim()].filter(Boolean).join('\n');
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+				throw new GitExecutableNotFoundError();
+			}
+
+			const gitError = error as Error & { stderr?: string; stdout?: string };
+			const details = [gitError.stderr?.trim(), gitError.stdout?.trim()].filter(Boolean).join('\n') || gitError.message;
+			return details;
+		}
+	}
+
 	async applyPatch(repositoryPath: string, patchPath: string): Promise<void> {
 		await this.runGit(repositoryPath, ['apply', '--', patchPath]);
 	}
@@ -162,5 +185,13 @@ export class GitService {
 
 	async push(repositoryPath: string): Promise<void> {
 		await this.runGit(repositoryPath, ['push']);
+	}
+
+	async getHeadCommitSha(repositoryPath: string): Promise<string> {
+		return this.runGit(repositoryPath, ['rev-parse', 'HEAD']);
+	}
+
+	async getCurrentBranch(repositoryPath: string): Promise<string> {
+		return this.runGit(repositoryPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
 	}
 }

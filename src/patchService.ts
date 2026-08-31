@@ -4,6 +4,26 @@ import { EOL } from 'os';
 import { basename, dirname, extname, join, resolve } from 'path';
 import { GitService } from './gitService';
 import { PatchState, PatchStateService } from './patchStateService';
+import {
+	applyPatchSummary,
+	buildPatchPreview,
+	extractAffectedPathsFromOutputs,
+	parsePatchNumStat,
+	parsePatchSummary,
+	PatchPreview,
+	PatchPreviewChangeType,
+	PatchPreviewFile,
+	PatchSummaryEntry,
+} from './patchStats';
+import { AuditHistoryService } from './auditHistoryService';
+import { parseConflictDiagnostics, PatchConflictDiagnostic } from './conflictDiagnostics';
+import { PatchDetailsPresentation } from './patchDetailsPreviewProvider';
+import {
+	getPatchMetadataFileName,
+	PatchMetadata,
+	PatchMetadataService,
+} from './patchMetadataService';
+import { RollbackService } from './rollbackService';
 
 export type CreatePatchResult =
 	| { status: 'noChanges' }
@@ -39,22 +59,15 @@ export interface PatchFile {
 export interface PatchApplicationPlan {
 	patch: PatchFile;
 	olderUnappliedPatchName?: string;
+	missingPredecessorSha?: string;
 }
 
-export type PatchPreviewChangeType = 'Modified' | 'Added' | 'Deleted' | 'Renamed';
-
-export interface PatchPreviewFile {
-	path: string;
-	originalPath?: string;
-	changeType: PatchPreviewChangeType;
-	additions?: number;
-	deletions?: number;
-}
-
-export interface PatchPreview {
-	patchName: string;
-	files: PatchPreviewFile[];
-}
+export {
+	PatchPreview,
+	PatchPreviewChangeType,
+	PatchPreviewFile,
+	PatchSummaryEntry,
+};
 
 export type ApplyPatchResult =
 	| { status: 'applied'; patchName: string }
@@ -70,11 +83,7 @@ interface PatchCandidate {
 	timestamp: Date;
 }
 
-interface PatchSummaryEntry {
-	path: string;
-	originalPath?: string;
-	changeType: Exclude<PatchPreviewChangeType, 'Modified'>;
-}
+
 
 type TransferPatchResult =
 	| { status: 'copied'; fileName: string; path: string; renamed: boolean }
@@ -86,12 +95,21 @@ type PatchDestinationResolution =
 
 export class PatchService {
 	private readonly stateService: PatchStateService;
+	private readonly rollbackService: RollbackService | undefined;
+	private readonly metadataService: PatchMetadataService;
+	private readonly historyService: AuditHistoryService;
 
 	constructor(
 		private readonly gitService: GitService,
 		stateService?: PatchStateService,
+		rollbackService?: RollbackService,
+		metadataService?: PatchMetadataService,
+		historyService?: AuditHistoryService,
 	) {
 		this.stateService = stateService ?? new PatchStateService(gitService);
+		this.rollbackService = rollbackService;
+		this.metadataService = metadataService ?? new PatchMetadataService(gitService);
+		this.historyService = historyService ?? new AuditHistoryService(gitService);
 	}
 
 	async ensureRepositorySetup(workspacePath: string): Promise<void> {
@@ -112,6 +130,22 @@ export class PatchService {
 			basename(patchPath),
 			sourceSha256,
 		);
+
+		// Copy sidecar metadata if present.
+		try {
+			const sidecar = await this.metadataService.readSidecar(patchPath);
+			if (sidecar && sidecar.patchSha256 === sourceSha256) {
+				const sidecarTargetName = getPatchMetadataFileName(result.fileName);
+				const sidecarTargetPath = join(destinationDirectory, sidecarTargetName);
+				await this.metadataService.writeSidecar(sidecarTargetPath, {
+					...sidecar,
+					patchFileName: result.fileName,
+				});
+			}
+		} catch {
+			// Sidecar copy failure must not fail patch transfer.
+		}
+
 		if (result.status === 'alreadyExists') {
 			return {
 				status: 'alreadyExists',
@@ -161,6 +195,41 @@ export class PatchService {
 				patchPath: result.path,
 			};
 		}
+
+		// Import sidecar metadata if present.
+		let sidecar: PatchMetadata | undefined;
+		try {
+			const candidateSidecar = await this.metadataService.readSidecar(externalPatchPath);
+			if (candidateSidecar) {
+				const validated = this.metadataService.validateMetadata(
+					candidateSidecar,
+					sourceSha256,
+				);
+				if (validated) {
+					sidecar = validated;
+					await this.metadataService.writeSidecar(result.path, {
+						...validated,
+						patchFileName: result.fileName,
+					});
+					await this.metadataService.saveLocalMetadata(
+						repositoryPath,
+						sourceSha256,
+						validated,
+					);
+				}
+			}
+		} catch {
+			// Metadata import error must not fail patch import.
+		}
+
+		// Record IMPORTED in audit history for newly imported patches.
+		await this.historyService.recordEvent(repositoryPath, {
+			timestamp: new Date().toISOString(),
+			event: 'IMPORTED',
+			patchSha256: sourceSha256,
+			patchFileName: result.fileName,
+			filesCount: sidecar?.stats?.files,
+		});
 
 		return {
 			status: 'imported',
@@ -254,15 +323,81 @@ export class PatchService {
 			throw new Error(`Patch validation failed: ${this.getErrorMessage(error)}`);
 		}
 
+		const previousPatchSha256 =
+			(await this.stateService.getLatestCreatedSha(repositoryPath)) ?? null;
+
 		try {
 			const sha256 = await this.stateService.calculatePatchSha256(patchPath);
 			await this.stateService.recordCreated(repositoryPath, sha256, patchName);
-		} catch (error) {
-			throw new Error(`Created patch tracking failed: ${this.getErrorMessage(error)}`);
-		}
 
-		try {
 			await this.gitService.commit(repositoryPath, normalizedCommitMessage);
+
+			let commitSha: string | undefined;
+			let branch: string | undefined;
+			try {
+				commitSha = await this.gitService.getHeadCommitSha(repositoryPath);
+			} catch {
+				// Best-effort.
+			}
+			try {
+				branch = await this.gitService.getCurrentBranch(repositoryPath);
+			} catch {
+				// Best-effort.
+			}
+
+			let filesCount = 0;
+			let additions: number | undefined;
+			let deletions: number | undefined;
+			let paths: string[] = [];
+			try {
+				const numStat = await this.gitService.getPatchNumStat(repositoryPath, patchPath);
+				const files = parsePatchNumStat(numStat);
+				filesCount = files.length;
+				paths = files.map(f => f.path);
+				additions = files.reduce((acc, f) => acc + (f.additions ?? 0), 0);
+				deletions = files.reduce((acc, f) => acc + (f.deletions ?? 0), 0);
+			} catch {
+				// Best-effort.
+			}
+
+			const createdAt = new Date().toISOString();
+			const metadata: PatchMetadata = {
+				version: 1,
+				patchSha256: sha256,
+				patchFileName: patchName,
+				createdAt,
+				source: {
+					commitSha,
+					branch,
+					repositoryName: basename(repositoryPath),
+				},
+				chain: {
+					previousPatchSha256,
+				},
+				stats: {
+					files: filesCount,
+					additions,
+					deletions,
+				},
+				paths,
+				extensionVersion: '0.1.0',
+			};
+
+			try {
+				await this.metadataService.writeSidecar(patchPath, metadata);
+				await this.metadataService.saveLocalMetadata(repositoryPath, sha256, metadata);
+			} catch {
+				// Best-effort.
+			}
+
+			await this.historyService.recordEvent(repositoryPath, {
+				timestamp: createdAt,
+				event: 'CREATED',
+				patchSha256: sha256,
+				patchFileName: patchName,
+				sourceCommitSha: commitSha,
+				filesCount,
+			});
 		} catch (error) {
 			throw new Error(`Commit failed: ${this.getErrorMessage(error)}`);
 		}
@@ -296,10 +431,36 @@ export class PatchService {
 			this.gitService.getPatchNumStat(repositoryPath, safePatchPath),
 			this.gitService.getPatchSummary(repositoryPath, safePatchPath),
 		]);
-		const files = this.parsePatchNumStat(numStat);
-		this.applyPatchSummary(files, this.parsePatchSummary(summary));
+		return buildPatchPreview(safePatchPath, numStat, summary);
+	}
 
-		return { patchName: basename(safePatchPath), files };
+	async getAffectedPaths(repositoryPath: string, patchPath: string): Promise<string[]> {
+		const [numStat, summary] = await Promise.all([
+			this.gitService.getPatchNumStat(repositoryPath, patchPath),
+			this.gitService.getPatchSummary(repositoryPath, patchPath),
+		]);
+		return extractAffectedPathsFromOutputs(numStat, summary);
+	}
+
+	async getConflictDiagnostics(
+		repositoryPath: string,
+		patchPath: string,
+	): Promise<PatchConflictDiagnostic> {
+		const safePatchPath = this.validatePatchPath(repositoryPath, patchPath);
+		const patchFileName = basename(safePatchPath);
+		let patchSha: string | undefined;
+		try {
+			patchSha = await this.stateService.calculatePatchSha256(safePatchPath);
+		} catch {
+			// Best-effort.
+		}
+
+		const rawOutput = await this.gitService.getPatchCheckDiagnostics(
+			repositoryPath,
+			safePatchPath,
+		);
+
+		return parseConflictDiagnostics(rawOutput, patchFileName, patchSha);
 	}
 
 	async preparePatchApplication(
@@ -326,7 +487,111 @@ export class PatchService {
 			state,
 		);
 
-		return { patch, olderUnappliedPatchName };
+		let missingPredecessorSha: string | undefined;
+		const candidateSha = await this.stateService
+			.calculatePatchSha256(candidate.path)
+			.catch(() => undefined);
+		if (candidateSha) {
+			const metadata = await this.metadataService.getEffectiveMetadata(
+				repositoryPath,
+				safePatchPath,
+				candidateSha,
+			);
+			if (metadata && metadata.chain.previousPatchSha256) {
+				const candidateShas = new Set<string>();
+				for (const c of candidates) {
+					try {
+						candidateShas.add(await this.stateService.calculatePatchSha256(c.path));
+					} catch {
+						// Ignore unreadable.
+					}
+				}
+				const gap = await this.metadataService.checkChainGap(
+					repositoryPath,
+					metadata,
+					state,
+					candidateShas,
+				);
+				if (gap.hasGap) {
+					missingPredecessorSha = gap.missingSha;
+				}
+			}
+		}
+
+		return { patch, olderUnappliedPatchName, missingPredecessorSha };
+	}
+
+	async getPatchDetails(
+		repositoryPath: string,
+		patchPath: string,
+	): Promise<PatchDetailsPresentation> {
+		const safePatchPath = this.validatePatchPath(repositoryPath, patchPath);
+		const patchFileName = basename(safePatchPath);
+		let sha256: string | undefined;
+		try {
+			sha256 = await this.stateService.calculatePatchSha256(safePatchPath);
+		} catch {
+			// Best-effort.
+		}
+
+		const state = await this.stateService.load(repositoryPath);
+		const candidates = await this.readPatchCandidates(repositoryPath);
+		const candidate = candidates.find(item => this.pathsEqual(item.path, safePatchPath));
+		const evaluated = candidate
+			? await this.evaluatePatch(repositoryPath, candidate, state)
+			: undefined;
+		const status = evaluated?.status ?? 'READY';
+
+		const metadata = await this.metadataService.getEffectiveMetadata(
+			repositoryPath,
+			safePatchPath,
+			sha256,
+		);
+
+		let hasMissingPredecessor = false;
+		let missingPredecessorSha: string | undefined;
+		if (metadata && metadata.chain.previousPatchSha256) {
+			const candidateShas = new Set<string>();
+			for (const c of candidates) {
+				try {
+					candidateShas.add(await this.stateService.calculatePatchSha256(c.path));
+				} catch {
+					// Ignore.
+				}
+			}
+			const gap = await this.metadataService.checkChainGap(
+				repositoryPath,
+				metadata,
+				state,
+				candidateShas,
+			);
+			hasMissingPredecessor = gap.hasGap;
+			missingPredecessorSha = gap.missingSha;
+		}
+
+		let affectedPaths: string[] | undefined;
+		let stats: { files: number; additions?: number; deletions?: number } | undefined;
+		try {
+			const numStat = await this.gitService.getPatchNumStat(repositoryPath, safePatchPath);
+			const files = parsePatchNumStat(numStat);
+			affectedPaths = files.map(f => f.path);
+			const additions = files.reduce((acc, f) => acc + (f.additions ?? 0), 0);
+			const deletions = files.reduce((acc, f) => acc + (f.deletions ?? 0), 0);
+			stats = { files: files.length, additions, deletions };
+		} catch {
+			// Best-effort.
+		}
+
+		return {
+			patchFileName,
+			status,
+			sha256,
+			metadata,
+			hasMissingPredecessor,
+			missingPredecessorSha,
+			stats,
+			affectedPaths,
+		};
 	}
 
 	async applyPatch(repositoryPath: string, patchPath: string): Promise<ApplyPatchResult> {
@@ -375,9 +640,35 @@ export class PatchService {
 			};
 		}
 
+		// Create pre-apply snapshot if rollback service is available.
+		let tempSnapshotDirectory: string | undefined;
+		if (this.rollbackService) {
+			try {
+				const affectedPaths = await this.rollbackService.resolveAffectedPaths(
+					repositoryPath,
+					safePatchPath,
+				);
+				tempSnapshotDirectory = await this.rollbackService.createSnapshot(
+					repositoryPath,
+					sha256,
+					patchName,
+					affectedPaths,
+				);
+			} catch (error) {
+				return {
+					status: 'applyFailed',
+					patchName,
+					error: `Rollback snapshot failed: ${this.getErrorMessage(error)}`,
+				};
+			}
+		}
+
 		try {
 			await this.gitService.applyPatch(repositoryPath, safePatchPath);
 		} catch (error) {
+			if (tempSnapshotDirectory && this.rollbackService) {
+				await this.rollbackService.cleanupTempSnapshot(tempSnapshotDirectory);
+			}
 			return {
 				status: 'applyFailed',
 				patchName,
@@ -385,8 +676,32 @@ export class PatchService {
 			};
 		}
 
+		// Finalize rollback snapshot after successful apply.
+		if (tempSnapshotDirectory && this.rollbackService) {
+			try {
+				await this.rollbackService.finalizeSnapshot(
+					repositoryPath,
+					sha256,
+					tempSnapshotDirectory,
+				);
+			} catch (error) {
+				await this.rollbackService.cleanupTempSnapshot(tempSnapshotDirectory);
+				return {
+					status: 'applyFailed',
+					patchName,
+					error: `Rollback finalization failed: ${this.getErrorMessage(error)}`,
+				};
+			}
+		}
+
 		try {
 			await this.stateService.recordApplied(repositoryPath, sha256, patchName);
+			await this.historyService.recordEvent(repositoryPath, {
+				timestamp: new Date().toISOString(),
+				event: 'APPLIED',
+				patchSha256: sha256,
+				patchFileName: patchName,
+			});
 			return { status: 'applied', patchName };
 		} catch (error) {
 			return {
@@ -454,94 +769,19 @@ export class PatchService {
 		}
 	}
 
-	private parsePatchNumStat(output: string): PatchPreviewFile[] {
-		return output
-			.split(/\r?\n/)
-			.filter(line => line.length > 0)
-			.map(line => {
-				const [added, deleted, ...pathParts] = line.split('\t');
-				if (!added || !deleted || pathParts.length === 0) {
-					throw new Error(`Could not parse patch statistics: ${line}`);
-				}
-
-				return {
-					path: pathParts.join('\t'),
-					changeType: 'Modified' as const,
-					additions: this.parsePatchLineCount(added),
-					deletions: this.parsePatchLineCount(deleted),
-				};
-			});
+	parsePatchNumStat(output: string): PatchPreviewFile[] {
+		return parsePatchNumStat(output);
 	}
 
-	private parsePatchSummary(output: string): PatchSummaryEntry[] {
-		const entries: PatchSummaryEntry[] = [];
-		let renameFrom: string | undefined;
-
-		for (const rawLine of output.split(/\r?\n/)) {
-			const line = rawLine.trim();
-			let match = /^create mode \d+ (.+)$/.exec(line);
-			if (match) {
-				entries.push({ path: match[1], changeType: 'Added' });
-				continue;
-			}
-
-			match = /^delete mode \d+ (.+)$/.exec(line);
-			if (match) {
-				entries.push({ path: match[1], changeType: 'Deleted' });
-				continue;
-			}
-
-			match = /^rename (.+) => (.+) \(\d+%\)$/.exec(line);
-			if (match) {
-				entries.push({
-					path: match[2],
-					originalPath: match[1],
-					changeType: 'Renamed',
-				});
-				continue;
-			}
-
-			match = /^rename from (.+)$/.exec(line);
-			if (match) {
-				renameFrom = match[1];
-				continue;
-			}
-
-			match = /^rename to (.+)$/.exec(line);
-			if (match && renameFrom) {
-				entries.push({
-					path: match[1],
-					originalPath: renameFrom,
-					changeType: 'Renamed',
-				});
-				renameFrom = undefined;
-			}
-		}
-
-		return entries;
+	parsePatchSummary(output: string): PatchSummaryEntry[] {
+		return parsePatchSummary(output);
 	}
 
-	private applyPatchSummary(
+	applyPatchSummary(
 		files: PatchPreviewFile[],
 		summaryEntries: PatchSummaryEntry[],
 	): void {
-		for (const summary of summaryEntries) {
-			const file = files.find(candidate =>
-				candidate.path === summary.path ||
-				(summary.changeType === 'Renamed' &&
-					candidate.changeType === 'Modified' &&
-					(candidate.path.includes('=>') ||
-						candidate.path.includes(summary.path) ||
-						candidate.path.includes(summary.originalPath ?? '\0'))),
-			);
-			if (file) {
-				file.path = summary.path;
-				file.originalPath = summary.originalPath;
-				file.changeType = summary.changeType;
-			} else {
-				files.push({ ...summary });
-			}
-		}
+		applyPatchSummary(files, summaryEntries);
 	}
 
 	private parsePatchLineCount(value: string): number | undefined {

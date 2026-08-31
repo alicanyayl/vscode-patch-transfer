@@ -1,14 +1,45 @@
 {
   "name": "patch-transfer",
   "displayName": "Patch Transfer",
-  "description": "offline patch transfer maneger for vs code ",
-  "version": "0.0.3",
+  "description": "Safely create, transfer, inspect, apply, and roll back code patches across offline and air-gapped VS Code environments.",
+  "version": "0.1.0",
+  "publisher": "Alicanyayl",
+  "license": "MIT",
+  "pricing": "Free",
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#1f1f1f",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alicanyayl/vscode-patch-transfer.git"
+  },
+  "homepage": "https://github.com/alicanyayl/vscode-patch-transfer#readme",
+  "bugs": {
+    "url": "https://github.com/alicanyayl/vscode-patch-transfer/issues"
+  },
+  "keywords": [
+    "offline",
+    "air-gapped",
+    "patch",
+    "git",
+    "transfer",
+    "deployment",
+    "secure",
+    "diff",
+    "rollback",
+    "conflict",
+    "disconnected",
+    "source-control"
+  ],
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
   "engines": {
     "vscode": "^1.134.0"
   },
-  "categories": [
-    "Other"
-  ],
   "extensionDependencies": [
     "vscode.git"
   ],
@@ -22,7 +53,12 @@
     "onCommand:patch-transfer.setTransferFolder",
     "onCommand:patch-transfer.previewPatch",
     "onCommand:patch-transfer.applyPatch",
-    "onCommand:patch-transfer.showPatchError"
+    "onCommand:patch-transfer.showPatchError",
+    "onCommand:patch-transfer.undoLastPatch",
+    "onCommand:patch-transfer.showConflictDetails",
+    "onCommand:patch-transfer.copyConflictDiagnostics",
+    "onCommand:patch-transfer.showHistory",
+    "onCommand:patch-transfer.showPatchDetails"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -73,6 +109,39 @@
         "title": "Show Patch Error",
         "icon": "$(output)",
         "enablement": "patchTransfer.patchHasError"
+      },
+      {
+        "command": "patch-transfer.undoLastPatch",
+        "title": "Undo Last Patch",
+        "shortTitle": "Undo Last Patch",
+        "category": "Patch Transfer",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "patch-transfer.showConflictDetails",
+        "title": "Show Conflict Details",
+        "shortTitle": "Conflict Details",
+        "category": "Patch Transfer",
+        "icon": "$(issues)"
+      },
+      {
+        "command": "patch-transfer.copyConflictDiagnostics",
+        "title": "Copy Conflict Diagnostics",
+        "category": "Patch Transfer"
+      },
+      {
+        "command": "patch-transfer.showHistory",
+        "title": "Show History",
+        "shortTitle": "History",
+        "category": "Patch Transfer",
+        "icon": "$(history)"
+      },
+      {
+        "command": "patch-transfer.showPatchDetails",
+        "title": "Show Patch Details",
+        "shortTitle": "Patch Details",
+        "category": "Patch Transfer",
+        "icon": "$(info)"
       }
     ],
     "viewsContainers": {
@@ -128,12 +197,22 @@
           "command": "patch-transfer.setTransferFolder",
           "when": "view == patch-transfer.patches",
           "group": "navigation@3"
+        },
+        {
+          "command": "patch-transfer.undoLastPatch",
+          "when": "view == patch-transfer.patches",
+          "group": "navigation@4"
+        },
+        {
+          "command": "patch-transfer.showHistory",
+          "when": "view == patch-transfer.patches",
+          "group": "navigation@5"
         }
       ],
       "view/item/context": [
         {
           "command": "patch-transfer.previewPatch",
-          "when": "view == patch-transfer.patches && (viewItem == patchTransfer.patch.ready || viewItem == patchTransfer.patch.conflict || viewItem == patchTransfer.patch.created || viewItem == patchTransfer.patch.applied)",
+          "when": "view == patch-transfer.patches && (viewItem == patchTransfer.patch.ready || viewItem == patchTransfer.patch.conflict || viewItem == patchTransfer.patch.created || viewItem == patchTransfer.patch.applied || viewItem == patchTransfer.patch.applied.undoable)",
           "group": "inline@1"
         },
         {
@@ -142,7 +221,7 @@
           "group": "inline@2"
         },
         {
-          "command": "patch-transfer.showPatchError",
+          "command": "patch-transfer.showConflictDetails",
           "when": "view == patch-transfer.patches && viewItem == patchTransfer.patch.conflict",
           "group": "inline@2"
         },
@@ -150,6 +229,16 @@
           "command": "patch-transfer.showPatchError",
           "when": "view == patch-transfer.patches && viewItem == patchTransfer.patch.invalid",
           "group": "inline@1"
+        },
+        {
+          "command": "patch-transfer.showPatchDetails",
+          "when": "view == patch-transfer.patches && (viewItem == patchTransfer.patch.ready || viewItem == patchTransfer.patch.conflict || viewItem == patchTransfer.patch.created || viewItem == patchTransfer.patch.applied || viewItem == patchTransfer.patch.applied.undoable)",
+          "group": "2_details"
+        },
+        {
+          "command": "patch-transfer.undoLastPatch",
+          "when": "view == patch-transfer.patches && viewItem == patchTransfer.patch.applied.undoable",
+          "group": "inline@2"
         }
       ]
     }

@@ -45,7 +45,7 @@ suite('Unified Changes view', function () {
 		);
 		assert.strictEqual(views[0].type, 'webview');
 		assert.ok(!views.some(view => view.id.includes('commitComposer')));
-		assert.strictEqual(packageJson.version, '0.0.3');
+		assert.strictEqual(packageJson.version, '0.1.0');
 	});
 
 	test('contributes clear Preview and Apply actions only for appropriate patch states', async () => {

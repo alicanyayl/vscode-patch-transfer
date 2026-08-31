@@ -102,6 +102,51 @@ export class PatchStateService {
 		await this.write(repositoryPath, state);
 	}
 
+	async removeApplied(
+		repositoryPath: string,
+		sha256: string,
+	): Promise<void> {
+		const state = await this.load(repositoryPath);
+		if (!state.applied[sha256]) {
+			return;
+		}
+
+		delete state.applied[sha256];
+		await this.write(repositoryPath, state);
+	}
+
+	async getLatestAppliedSha(repositoryPath: string): Promise<string | undefined> {
+		const state = await this.load(repositoryPath);
+		let latestSha: string | undefined;
+		let latestTime = -Infinity;
+
+		for (const [sha256, record] of Object.entries(state.applied)) {
+			const time = Date.parse(record.appliedAt);
+			if (!Number.isNaN(time) && time > latestTime) {
+				latestTime = time;
+				latestSha = sha256;
+			}
+		}
+
+		return latestSha;
+	}
+
+	async getLatestCreatedSha(repositoryPath: string): Promise<string | undefined> {
+		const state = await this.load(repositoryPath);
+		let latestSha: string | undefined;
+		let latestTime = -Infinity;
+
+		for (const [sha256, record] of Object.entries(state.created)) {
+			const time = Date.parse(record.createdAt);
+			if (!Number.isNaN(time) && time > latestTime) {
+				latestTime = time;
+				latestSha = sha256;
+			}
+		}
+
+		return latestSha;
+	}
+
 	async getStatePath(repositoryPath: string): Promise<string> {
 		const gitDirectory = await this.gitService.getGitDirectory(repositoryPath);
 		return join(gitDirectory, 'patch-transfer', 'state.json');

@@ -511,7 +511,10 @@ suite('Patch application workflow', function () {
 			transferDirectory,
 		);
 		assert.strictEqual(differentNameDuplicate.status, 'alreadyExists');
-		assert.deepStrictEqual(await readdir(transferDirectory), [createResult.patchName]);
+		assert.deepStrictEqual(
+			(await readdir(transferDirectory)).filter(file => file.endsWith('.patch')),
+			[createResult.patchName],
+		);
 
 		const collidingSourceDirectory = join(root, 'colliding-source');
 		const collidingSourcePath = join(collidingSourceDirectory, createResult.patchName);
