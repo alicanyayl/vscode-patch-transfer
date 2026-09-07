@@ -2,7 +2,7 @@
   "name": "patch-transfer",
   "displayName": "Patch Transfer",
   "description": "Safely create, transfer, inspect, apply, and roll back code patches across offline and air-gapped VS Code environments.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "Alicanyayl",
   "license": "MIT",
   "pricing": "Free",
@@ -57,6 +57,7 @@
     "onCommand:patch-transfer.undoLastPatch",
     "onCommand:patch-transfer.showConflictDetails",
     "onCommand:patch-transfer.copyConflictDiagnostics",
+    "onCommand:patch-transfer.resolveConflicts",
     "onCommand:patch-transfer.showHistory",
     "onCommand:patch-transfer.showPatchDetails"
   ],
@@ -128,6 +129,13 @@
         "command": "patch-transfer.copyConflictDiagnostics",
         "title": "Copy Conflict Diagnostics",
         "category": "Patch Transfer"
+      },
+      {
+        "command": "patch-transfer.resolveConflicts",
+        "title": "Resolve patch conflicts",
+        "shortTitle": "Resolve Conflicts",
+        "category": "Patch Transfer",
+        "icon": "$(git-merge)"
       },
       {
         "command": "patch-transfer.showHistory",
@@ -224,6 +232,11 @@
           "command": "patch-transfer.showConflictDetails",
           "when": "view == patch-transfer.patches && viewItem == patchTransfer.patch.conflict",
           "group": "inline@2"
+        },
+        {
+          "command": "patch-transfer.resolveConflicts",
+          "when": "view == patch-transfer.patches && viewItem == patchTransfer.patch.conflict",
+          "group": "inline@3"
         },
         {
           "command": "patch-transfer.showPatchError",

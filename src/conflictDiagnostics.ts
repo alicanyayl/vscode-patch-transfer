@@ -51,21 +51,24 @@ export function parseConflictDiagnostics(
 
 	for (const line of lines) {
 		// Pattern 1: error: patch failed: src/foo.ts:42 or patch failed: src/foo.ts:42
-		let match = /(?:error:\s*)?patch failed:\s*([^:]+):(\d+)/i.exec(line);
+		let match = /(?:error:\s*)?patch failed:\s*([^:]+|[A-Za-z]:[^:]+):(\d+)/i.exec(line);
 		if (match) {
 			const path = match[1].trim();
 			const lineNumber = Number(match[2]);
 			const existing = fileMap.get(path);
-			fileMap.set(path, {
-				line: lineNumber,
-				reason: 'context-mismatch',
-				message: line,
-			});
+			// Only set context-mismatch if no more specific reason has been determined
+			if (!existing || existing.reason === 'unknown' || existing.reason === 'context-mismatch') {
+				fileMap.set(path, {
+					line: lineNumber,
+					reason: 'context-mismatch',
+					message: line,
+				});
+			}
 			continue;
 		}
 
 		// Pattern 2: error: src/foo.ts: patch does not apply or src/foo.ts: patch does not apply
-		match = /(?:error:\s*)?([^:]+):\s*patch does not apply/i.exec(line);
+		match = /(?:error:\s*)?([^:]+|[A-Za-z]:[^:]+):\s*patch does not apply/i.exec(line);
 		if (match) {
 			const path = match[1].trim();
 			const existing = fileMap.get(path);
@@ -80,7 +83,7 @@ export function parseConflictDiagnostics(
 		}
 
 		// Pattern 3: error: src/foo.ts: No such file or directory or does not exist in index
-		match = /(?:error:\s*)?([^:]+):\s*(?:No such file or directory|does not exist in (?:index|working directory))/i.exec(line);
+		match = /(?:error:\s*)?([^:]+|[A-Za-z]:[^:]+):\s*(?:No such file or directory|does not exist in (?:index|working directory))/i.exec(line);
 		if (match) {
 			const path = match[1].trim();
 			fileMap.set(path, {
@@ -91,7 +94,7 @@ export function parseConflictDiagnostics(
 		}
 
 		// Pattern 4: error: src/foo.ts: already exists in working directory
-		match = /(?:error:\s*)?([^:]+):\s*already exists in (?:working directory|index)/i.exec(line);
+		match = /(?:error:\s*)?([^:]+|[A-Za-z]:[^:]+):\s*already exists in (?:working directory|index)/i.exec(line);
 		if (match) {
 			const path = match[1].trim();
 			fileMap.set(path, {
@@ -102,7 +105,7 @@ export function parseConflictDiagnostics(
 		}
 
 		// Pattern 5: error: src/foo.ts: deletion of file ... or renamed
-		match = /(?:error:\s*)?([^:]+):\s*(?:deletion failed|cannot delete|file was renamed)/i.exec(line);
+		match = /(?:error:\s*)?([^:]+|[A-Za-z]:[^:]+):\s*(?:deletion failed|cannot delete|file was renamed)/i.exec(line);
 		if (match) {
 			const path = match[1].trim();
 			fileMap.set(path, {

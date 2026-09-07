@@ -12,6 +12,11 @@ export interface AuditEvent {
 	patchFileName: string;
 	sourceCommitSha?: string;
 	filesCount?: number;
+	resolution?: {
+		current: number;
+		patch: number;
+		manual: number;
+	};
 }
 
 export interface AuditHistory {
@@ -54,13 +59,23 @@ export class AuditHistoryService {
 	}
 
 	async recordEvent(repositoryPath: string, event: AuditEvent): Promise<void> {
-		try {
-			const history = await this.loadHistory(repositoryPath);
-			history.events.push(event);
-			const historyPath = await this.getHistoryPath(repositoryPath);
-			await this.atomicWriteJson(historyPath, history);
-		} catch {
-			// Best-effort write. Audit failure must not crash core operations.
+		// Retry-with-re-read pattern to handle concurrent writes to history.json.
+		const maxRetries = 3;
+		for (let attempt = 0; attempt <= maxRetries; attempt++) {
+			try {
+				const history = await this.loadHistory(repositoryPath);
+				history.events.push(event);
+				const historyPath = await this.getHistoryPath(repositoryPath);
+				await this.atomicWriteJson(historyPath, history);
+				return;
+			} catch {
+				if (attempt === maxRetries) {
+					// Best-effort write. Audit failure must not crash core operations.
+					return;
+				}
+				// Brief delay before retry to reduce contention
+				await new Promise<void>(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+			}
 		}
 	}
 
@@ -115,6 +130,11 @@ export class AuditHistoryService {
 				}
 				if (event.filesCount !== undefined) {
 					lines.push(`Files: ${event.filesCount}`);
+				}
+				if (event.resolution) {
+					lines.push(
+						`Resolution: Keep Current ${event.resolution.current}, Use Patch ${event.resolution.patch}, Manual ${event.resolution.manual}`,
+					);
 				}
 			}
 		}

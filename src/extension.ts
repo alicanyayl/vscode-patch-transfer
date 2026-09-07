@@ -17,12 +17,19 @@ import { formatConflictClipboardReport } from './conflictDiagnostics';
 import { HistoryPreviewProvider } from './historyPreviewProvider';
 import { PatchDetailsPreviewProvider } from './patchDetailsPreviewProvider';
 import { PatchMetadataService } from './patchMetadataService';
-import { CreatePatchResult, PatchService } from './patchService';
+import { CreatePatchResult, PatchFile, PatchService } from './patchService';
 import { PatchPreviewProvider } from './patchPreviewProvider';
-import { PatchesTreeProvider, PatchTreeItem } from './patchesTreeProvider';
+import {
+	isPatchTreeItem,
+	PatchesTreeProvider,
+	PatchTreeItem,
+	resolveTargetPatch,
+} from './patchesTreeProvider';
 import { PatchStateService } from './patchStateService';
 import { RollbackService } from './rollbackService';
 import { TransferFolderService, TransferWorkflowService } from './transferFolderService';
+import { ConflictDiffProvider } from './conflictDiffProvider';
+import { ConflictResolverPanel } from './conflictResolverPanel';
 
 const ignoredWatchDirectories = new Set([
 	'.git',
@@ -56,6 +63,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const conflictPreviewProvider = new ConflictPreviewProvider();
 	const historyPreviewProvider = new HistoryPreviewProvider(auditHistoryService);
 	const patchDetailsPreviewProvider = new PatchDetailsPreviewProvider();
+	const conflictDiffProvider = new ConflictDiffProvider();
+	const conflictResolutionService = patchServiceWithRollback.getResolutionService();
 	const transferFolders = new TransferFolderService(context.workspaceState);
 	const transferWorkflow = new TransferWorkflowService(transferFolders, patchService);
 	const patchesProvider = new PatchesTreeProvider(gitService, patchService, stateService, rollbackService);
@@ -102,6 +111,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			const workspacePath = workspaceFolder.uri.fsPath;
 			try {
 				await patchService.ensureRepositorySetup(workspacePath);
+				const repositoryPath = await gitService.getRepositoryRoot(workspacePath);
+				if (repositoryPath) {
+					void conflictResolutionService.cleanupStaleSessions(repositoryPath);
+				}
 				repositorySetupErrors.delete(workspacePath);
 			} catch (error) {
 				const details = error instanceof Error ? error.message : String(error);
@@ -122,11 +135,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		treeDataProvider: patchesProvider,
 	});
 	const fileWatcher = vscode.workspace.createFileSystemWatcher('**/*');
-	const patchWatcher = vscode.workspace.createFileSystemWatcher('**/.patch-transfer/*.patch');
+	const patchWatcher = vscode.workspace.createFileSystemWatcher(
+		'{**/.patch-transfer/*.patch,.patch-transfer/*.patch,**/*.patch}',
+	);
 	let activeOperation: 'creating' | 'applying' | 'importing' | 'undoing' | undefined;
 	let changesRefreshTimer: NodeJS.Timeout | undefined;
 	let patchesRefreshTimer: NodeJS.Timeout | undefined;
 	let lastPatchRefreshError: string | undefined;
+	let selectedPatchItem: PatchTreeItem | undefined;
 
 	const setActiveOperation = (
 		operation: 'creating' | 'applying' | 'importing' | 'undoing' | undefined,
@@ -148,10 +164,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		await changesViewProvider.refreshChanges();
 	};
 
-	const refreshPatches = async () => {
-		await patchesProvider.refresh();
+	const refreshPatches = async (repositoryPath?: string) => {
+		const targetPath = repositoryPath ?? await getActiveRepositoryPath();
+		await patchesProvider.refresh(targetPath);
 		updateBadges();
-		updatePatchCommandContexts(patchesView.selection[0]);
+		const currentSelection = patchesView.selection[0] ?? selectedPatchItem;
+		updatePatchCommandContexts(currentSelection);
 		reportPatchRefreshError();
 	};
 
@@ -181,9 +199,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		}, 300);
 	};
 
+	const handleFileEvent = (uri: vscode.Uri) => {
+		const fsPath = uri.fsPath;
+		if (fsPath.toLowerCase().endsWith('.patch') || fsPath.includes('.patch-transfer')) {
+			schedulePatchesRefresh();
+		}
+		if (!shouldIgnoreFileEvent(uri)) {
+			scheduleChangesRefresh(uri);
+		}
+	};
+
 	function updatePatchCommandContexts(selectedItem?: vscode.TreeItem): void {
-		const selectedPatch = selectedItem instanceof PatchTreeItem
-			? patchesProvider.getCurrentPatch(selectedItem.patch.path)
+		const targetItem = isPatchTreeItem(selectedItem) ? selectedItem : selectedPatchItem;
+		const selectedPatch = isPatchTreeItem(targetItem)
+			? (patchesProvider.getCurrentPatch(targetItem.patch.path) ?? targetItem.patch)
 			: undefined;
 		void vscode.commands.executeCommand(
 			'setContext',
@@ -205,13 +234,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		lastPatchRefreshError = error;
 	}
 
-	function getSelectedPatchItem(argument?: unknown): PatchTreeItem | undefined {
-		if (argument instanceof PatchTreeItem) {
-			return argument;
-		}
-
-		const selectedItem = patchesView.selection[0];
-		return selectedItem instanceof PatchTreeItem ? selectedItem : undefined;
+	function getTargetPatch(argument?: unknown): PatchFile | undefined {
+		return resolveTargetPatch(
+			argument,
+			patchesView.selection[0] ?? selectedPatchItem,
+			path => patchesProvider.getCurrentPatch(path),
+		);
 	}
 
 	function showPatchError(patchName: string, status: string, error: string): void {
@@ -312,10 +340,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		conflictPreviewProvider,
 		historyPreviewProvider,
 		patchDetailsPreviewProvider,
+		conflictDiffProvider,
 		PatchPreviewProvider.register(patchPreviewProvider),
 		ConflictPreviewProvider.register(conflictPreviewProvider),
 		HistoryPreviewProvider.register(historyPreviewProvider),
 		PatchDetailsPreviewProvider.register(patchDetailsPreviewProvider),
+		ConflictDiffProvider.register(conflictDiffProvider),
 		vscode.window.registerWebviewViewProvider(
 			'patch-transfer.changes',
 			changesViewProvider,
@@ -404,7 +434,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 					);
 				}
 				try {
-					await Promise.all([refreshChanges(), refreshPatches()]);
+					await Promise.all([refreshChanges(), refreshPatches(repositoryPath)]);
 				} finally {
 					setActiveOperation(undefined);
 				}
@@ -478,7 +508,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 					return;
 				}
 
-				await refreshPatches();
+				await refreshPatches(repositoryPath);
 				for (const invalidPatch of folderImport.result.invalid) {
 					outputChannel.appendLine(
 						`[Import Patch] ${invalidPatch.patchName}: ${invalidPatch.error}`,
@@ -514,9 +544,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				return;
 			}
 
-			const item = getSelectedPatchItem(argument);
-			const patch = item ? patchesProvider.getCurrentPatch(item.patch.path) : undefined;
-			if (!patch || patch.status === 'INVALID') {
+			const patch = getTargetPatch(argument);
+			if (!patch) {
+				vscode.window.showInformationMessage('Select a patch first.');
+				return;
+			}
+			if (patch.status === 'INVALID') {
 				vscode.window.showInformationMessage('Select a valid patch to preview.');
 				return;
 			}
@@ -549,18 +582,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				return;
 			}
 
-			const item = getSelectedPatchItem(argument);
-			if (!item) {
-				vscode.window.showInformationMessage('Select a ready patch to apply.');
+			const patch = getTargetPatch(argument);
+			if (!patch) {
+				vscode.window.showInformationMessage('Select a patch first.');
 				return;
 			}
 
-			const currentPatch = patchesProvider.getCurrentPatch(item.patch.path);
-			if (currentPatch?.status === 'APPLIED') {
+			if (patch.status === 'APPLIED') {
 				vscode.window.showInformationMessage('Patch has already been applied.');
 				return;
 			}
-			if (currentPatch?.status !== 'READY') {
+			if (patch.status !== 'READY') {
 				vscode.window.showInformationMessage('Only a ready patch can be applied.');
 				return;
 			}
@@ -569,7 +601,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			try {
 				const plan = await patchService.preparePatchApplication(
 					repositoryPath,
-					currentPatch.path,
+					patch.path,
 				);
 
 				if (plan.patch.status === 'APPLIED') {
@@ -668,10 +700,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			}
 		}),
 		vscode.commands.registerCommand('patch-transfer.showPatchError', (argument?: unknown) => {
-			const item = getSelectedPatchItem(argument);
-			const patch = item ? patchesProvider.getCurrentPatch(item.patch.path) : undefined;
+			const patch = getTargetPatch(argument);
+			if (!patch) {
+				vscode.window.showInformationMessage('Select a patch first.');
+				return;
+			}
 			if (
-				!patch ||
 				(patch.status !== 'CONFLICT' && patch.status !== 'INVALID') ||
 				!patch.error
 			) {
@@ -694,9 +728,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				return;
 			}
 
-			const item = getSelectedPatchItem(argument);
-			const patch = item ? patchesProvider.getCurrentPatch(item.patch.path) : undefined;
-			if (!patch || patch.status !== 'CONFLICT') {
+			const patch = getTargetPatch(argument);
+			if (!patch) {
+				vscode.window.showInformationMessage('Select a patch first.');
+				return;
+			}
+			if (patch.status !== 'CONFLICT') {
 				vscode.window.showInformationMessage('Select a conflicting patch to view conflict details.');
 				return;
 			}
@@ -709,9 +746,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				return;
 			}
 
-			const item = getSelectedPatchItem(argument);
-			const patch = item ? patchesProvider.getCurrentPatch(item.patch.path) : undefined;
-			if (!patch || patch.status !== 'CONFLICT') {
+			const patch = getTargetPatch(argument);
+			if (!patch) {
+				vscode.window.showInformationMessage('Select a patch first.');
+				return;
+			}
+			if (patch.status !== 'CONFLICT') {
 				vscode.window.showInformationMessage('Select a conflicting patch to copy conflict diagnostics.');
 				return;
 			}
@@ -724,6 +764,45 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				vscode.window.showErrorMessage(`Could not copy conflict diagnostics: ${message}`);
+			}
+		}),
+		vscode.commands.registerCommand('patch-transfer.resolveConflicts', async (argument?: unknown) => {
+			if (activeOperation) {
+				vscode.window.showInformationMessage(
+					'Another Patch Transfer Git operation is already running.',
+				);
+				return;
+			}
+
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
+				return;
+			}
+
+			const patch = getTargetPatch(argument);
+			if (!patch) {
+				vscode.window.showInformationMessage('Select a patch first.');
+				return;
+			}
+			if (patch.status !== 'CONFLICT') {
+				vscode.window.showInformationMessage('Select a conflicting patch to resolve conflicts.');
+				return;
+			}
+
+			try {
+				await ConflictResolverPanel.show(
+					context.extensionUri,
+					repositoryPath,
+					patch.path,
+					conflictResolutionService,
+					conflictDiffProvider,
+					async () => {
+						await Promise.all([refreshChanges(), refreshPatches()]);
+					},
+				);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Could not start conflict resolver: ${message}`);
 			}
 		}),
 		vscode.commands.registerCommand('patch-transfer.undoLastPatch', async () => {
@@ -828,10 +907,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				return;
 			}
 
-			const item = getSelectedPatchItem(argument);
-			const patch = item ? patchesProvider.getCurrentPatch(item.patch.path) : undefined;
+			const patch = getTargetPatch(argument);
 			if (!patch) {
-				vscode.window.showInformationMessage('Select a patch to view details.');
+				vscode.window.showInformationMessage('Select a patch first.');
 				return;
 			}
 
@@ -841,14 +919,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.commands.registerCommand('patch-transfer.refresh', refreshChanges),
 		vscode.commands.registerCommand('patch-transfer.refreshPatches', refreshPatches),
 		fileWatcher,
-		fileWatcher.onDidCreate(scheduleChangesRefresh),
-		fileWatcher.onDidChange(scheduleChangesRefresh),
-		fileWatcher.onDidDelete(scheduleChangesRefresh),
+		fileWatcher.onDidCreate(handleFileEvent),
+		fileWatcher.onDidChange(handleFileEvent),
+		fileWatcher.onDidDelete(handleFileEvent),
 		patchWatcher,
 		patchWatcher.onDidCreate(schedulePatchesRefresh),
 		patchWatcher.onDidChange(schedulePatchesRefresh),
 		patchWatcher.onDidDelete(schedulePatchesRefresh),
-		patchesView.onDidChangeSelection(event => updatePatchCommandContexts(event.selection[0])),
+		patchesView.onDidChangeSelection(event => {
+			const item = event.selection[0];
+			selectedPatchItem = isPatchTreeItem(item) ? item : undefined;
+			updatePatchCommandContexts(selectedPatchItem);
+		}),
 		vscode.workspace.onDidChangeWorkspaceFolders(() => {
 			void (async () => {
 				await ensureActiveRepositorySetup();

@@ -934,7 +934,7 @@ suite('Patch application workflow', function () {
 			await readFile(join(destination, 'target.txt'), 'utf8'),
 			'applied without state\n',
 		);
-		assert.strictEqual((await new PatchService(gitService).listPatches(destination))[0].status, 'CONFLICT');
+		assert.strictEqual((await new PatchService(gitService).listPatches(destination))[0].status, 'APPLIED');
 	});
 
 	test('stores state in the actual Git directory for a worktree', async () => {

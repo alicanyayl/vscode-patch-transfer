@@ -78,13 +78,12 @@ export class PatchStateService {
 		fileName: string,
 		createdAt = new Date(),
 	): Promise<void> {
-		const state = await this.load(repositoryPath);
-		state.created[sha256] = {
-			fileName,
-			createdAt: createdAt.toISOString(),
-		};
-
-		await this.write(repositoryPath, state);
+		await this.retryMutation(repositoryPath, state => {
+			state.created[sha256] = {
+				fileName,
+				createdAt: createdAt.toISOString(),
+			};
+		});
 	}
 
 	async recordApplied(
@@ -93,26 +92,21 @@ export class PatchStateService {
 		fileName: string,
 		appliedAt = new Date(),
 	): Promise<void> {
-		const state = await this.load(repositoryPath);
-		state.applied[sha256] = {
-			fileName,
-			appliedAt: appliedAt.toISOString(),
-		};
-
-		await this.write(repositoryPath, state);
+		await this.retryMutation(repositoryPath, state => {
+			state.applied[sha256] = {
+				fileName,
+				appliedAt: appliedAt.toISOString(),
+			};
+		});
 	}
 
 	async removeApplied(
 		repositoryPath: string,
 		sha256: string,
 	): Promise<void> {
-		const state = await this.load(repositoryPath);
-		if (!state.applied[sha256]) {
-			return;
-		}
-
-		delete state.applied[sha256];
-		await this.write(repositoryPath, state);
+		await this.retryMutation(repositoryPath, state => {
+			delete state.applied[sha256];
+		});
 	}
 
 	async getLatestAppliedSha(repositoryPath: string): Promise<string | undefined> {
@@ -150,6 +144,32 @@ export class PatchStateService {
 	async getStatePath(repositoryPath: string): Promise<string> {
 		const gitDirectory = await this.gitService.getGitDirectory(repositoryPath);
 		return join(gitDirectory, 'patch-transfer', 'state.json');
+	}
+
+	/**
+	 * Retry-with-re-read pattern: re-reads state on each attempt to avoid
+	 * lost-update races when concurrent processes mutate the same file.
+	 */
+	private async retryMutation(
+		repositoryPath: string,
+		mutate: (state: PatchState) => void,
+		maxRetries = 3,
+	): Promise<void> {
+		for (let attempt = 0; attempt <= maxRetries; attempt++) {
+			const state = await this.load(repositoryPath);
+			mutate(state);
+
+			try {
+				await this.write(repositoryPath, state);
+				return;
+			} catch (error) {
+				if (attempt === maxRetries) {
+					throw error;
+				}
+				// Brief delay before retry to reduce contention
+				await new Promise<void>(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+			}
+		}
 	}
 
 	private async write(repositoryPath: string, state: PatchState): Promise<void> {

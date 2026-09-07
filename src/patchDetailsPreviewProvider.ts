@@ -17,6 +17,13 @@ export interface PatchDetailsPresentation {
 		deletions?: number;
 	};
 	affectedPaths?: string[];
+	resolution?: {
+		choices: {
+			current: number;
+			patch: number;
+			manual: number;
+		};
+	};
 }
 
 export function formatPatchDetailsDocument(details: PatchDetailsPresentation): string {
@@ -63,6 +70,18 @@ export function formatPatchDetailsDocument(details: PatchDetailsPresentation): s
 			'',
 			'Metadata:',
 			'Unavailable (legacy patch)',
+		);
+	}
+
+	if (details.resolution) {
+		lines.push(
+			'',
+			'Resolution:',
+			'Interactive',
+			'',
+			`Keep Current: ${details.resolution.choices.current}`,
+			`Use Patch: ${details.resolution.choices.patch}`,
+			`Manual: ${details.resolution.choices.manual}`,
 		);
 	}
 

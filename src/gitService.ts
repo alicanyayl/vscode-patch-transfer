@@ -149,14 +149,18 @@ export class GitService {
 	}
 
 	async checkPatch(repositoryPath: string, patchPath: string): Promise<void> {
-		await this.runGit(repositoryPath, ['apply', '--check', '--', patchPath]);
+		await this.runGit(repositoryPath, ['apply', '--check', '--whitespace=nowarn', '--', patchPath]);
+	}
+
+	async checkPatchReverse(repositoryPath: string, patchPath: string): Promise<void> {
+		await this.runGit(repositoryPath, ['apply', '--reverse', '--check', '--whitespace=nowarn', '--', patchPath]);
 	}
 
 	async getPatchCheckDiagnostics(repositoryPath: string, patchPath: string): Promise<string> {
 		try {
 			const { stdout, stderr } = await execFileAsync(
 				this.gitExecutable,
-				['apply', '--check', '--verbose', '--', patchPath],
+				['apply', '--check', '--verbose', '--whitespace=nowarn', '--', patchPath],
 				{
 					cwd: repositoryPath,
 					encoding: 'utf8',
@@ -176,7 +180,7 @@ export class GitService {
 	}
 
 	async applyPatch(repositoryPath: string, patchPath: string): Promise<void> {
-		await this.runGit(repositoryPath, ['apply', '--', patchPath]);
+		await this.runGit(repositoryPath, ['apply', '--whitespace=nowarn', '--', patchPath]);
 	}
 
 	async commit(repositoryPath: string, message: string): Promise<void> {

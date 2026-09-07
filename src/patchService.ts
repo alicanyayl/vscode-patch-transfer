@@ -24,6 +24,7 @@ import {
 	PatchMetadataService,
 } from './patchMetadataService';
 import { RollbackService } from './rollbackService';
+import { ConflictResolutionService } from './conflictResolutionService';
 
 export type CreatePatchResult =
 	| { status: 'noChanges' }
@@ -95,9 +96,10 @@ type PatchDestinationResolution =
 
 export class PatchService {
 	private readonly stateService: PatchStateService;
-	private readonly rollbackService: RollbackService | undefined;
+	private readonly rollbackService: RollbackService;
 	private readonly metadataService: PatchMetadataService;
 	private readonly historyService: AuditHistoryService;
+	private readonly resolutionService: ConflictResolutionService;
 
 	constructor(
 		private readonly gitService: GitService,
@@ -105,11 +107,24 @@ export class PatchService {
 		rollbackService?: RollbackService,
 		metadataService?: PatchMetadataService,
 		historyService?: AuditHistoryService,
+		resolutionService?: ConflictResolutionService,
 	) {
 		this.stateService = stateService ?? new PatchStateService(gitService);
-		this.rollbackService = rollbackService;
+		// Ensure a single RollbackService instance is shared between PatchService
+		// and ConflictResolutionService to avoid inconsistent backup state.
+		this.rollbackService = rollbackService ?? new RollbackService(gitService);
 		this.metadataService = metadataService ?? new PatchMetadataService(gitService);
 		this.historyService = historyService ?? new AuditHistoryService(gitService);
+		this.resolutionService = resolutionService ?? new ConflictResolutionService(
+			gitService,
+			this.rollbackService,
+			this.stateService,
+			this.historyService,
+		);
+	}
+
+	getResolutionService(): ConflictResolutionService {
+		return this.resolutionService;
 	}
 
 	async ensureRepositorySetup(workspacePath: string): Promise<void> {
@@ -582,6 +597,18 @@ export class PatchService {
 			// Best-effort.
 		}
 
+		let resolution: { choices: { current: number; patch: number; manual: number } } | undefined;
+		if (sha256) {
+			try {
+				const receipt = await this.resolutionService.getResolutionReceipt(repositoryPath, sha256);
+				if (receipt) {
+					resolution = { choices: receipt.choices };
+				}
+			} catch {
+				// Best-effort.
+			}
+		}
+
 		return {
 			patchFileName,
 			status,
@@ -591,6 +618,7 @@ export class PatchService {
 			missingPredecessorSha,
 			stats,
 			affectedPaths,
+			resolution,
 		};
 	}
 
@@ -632,41 +660,45 @@ export class PatchService {
 		try {
 			await this.gitService.checkPatch(repositoryPath, safePatchPath);
 		} catch (error) {
-			return {
-				status: 'notReady',
-				patchName,
-				patchStatus: 'CONFLICT',
-				error: this.getErrorMessage(error),
-			};
-		}
-
-		// Create pre-apply snapshot if rollback service is available.
-		let tempSnapshotDirectory: string | undefined;
-		if (this.rollbackService) {
 			try {
-				const affectedPaths = await this.rollbackService.resolveAffectedPaths(
-					repositoryPath,
-					safePatchPath,
-				);
-				tempSnapshotDirectory = await this.rollbackService.createSnapshot(
-					repositoryPath,
-					sha256,
-					patchName,
-					affectedPaths,
-				);
-			} catch (error) {
+				await this.gitService.checkPatchReverse(repositoryPath, safePatchPath);
+				return { status: 'alreadyApplied', patchName };
+			} catch {
 				return {
-					status: 'applyFailed',
+					status: 'notReady',
 					patchName,
-					error: `Rollback snapshot failed: ${this.getErrorMessage(error)}`,
+					patchStatus: 'CONFLICT',
+					error: this.getErrorMessage(error),
 				};
 			}
+		}
+
+
+		// Create pre-apply snapshot.
+		let tempSnapshotDirectory: string | undefined;
+		try {
+			const affectedPaths = await this.rollbackService.resolveAffectedPaths(
+				repositoryPath,
+				safePatchPath,
+			);
+			tempSnapshotDirectory = await this.rollbackService.createSnapshot(
+				repositoryPath,
+				sha256,
+				patchName,
+				affectedPaths,
+			);
+		} catch (error) {
+			return {
+				status: 'applyFailed',
+				patchName,
+				error: `Rollback snapshot failed: ${this.getErrorMessage(error)}`,
+			};
 		}
 
 		try {
 			await this.gitService.applyPatch(repositoryPath, safePatchPath);
 		} catch (error) {
-			if (tempSnapshotDirectory && this.rollbackService) {
+			if (tempSnapshotDirectory) {
 				await this.rollbackService.cleanupTempSnapshot(tempSnapshotDirectory);
 			}
 			return {
@@ -677,7 +709,7 @@ export class PatchService {
 		}
 
 		// Finalize rollback snapshot after successful apply.
-		if (tempSnapshotDirectory && this.rollbackService) {
+		if (tempSnapshotDirectory) {
 			try {
 				await this.rollbackService.finalizeSnapshot(
 					repositoryPath,
@@ -742,8 +774,9 @@ export class PatchService {
 		sourceSha256: string,
 	): Promise<TransferPatchResult> {
 		const safePreferredFileName = basename(preferredFileName);
+		const maxAttempts = 100;
 
-		for (;;) {
+		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			const destination = await this.resolveSafePatchDestination(
 				destinationDirectory,
 				safePreferredFileName,
@@ -767,6 +800,10 @@ export class PatchService {
 				}
 			}
 		}
+
+		throw new Error(
+			`Could not transfer patch file after ${maxAttempts} attempts: ${safePreferredFileName}`,
+		);
 	}
 
 	parsePatchNumStat(output: string): PatchPreviewFile[] {
@@ -883,44 +920,61 @@ export class PatchService {
 		candidate: PatchCandidate,
 		state: PatchState,
 	): Promise<PatchFile> {
-		let sha256: string;
-
 		try {
-			sha256 = await this.stateService.calculatePatchSha256(candidate.path);
+			let sha256: string;
+
+			try {
+				sha256 = await this.stateService.calculatePatchSha256(candidate.path);
+			} catch (error) {
+				return {
+					...candidate,
+					status: 'INVALID',
+					error: `Could not read patch file: ${this.getErrorMessage(error)}`,
+				};
+			}
+
+			if (state.applied[sha256]) {
+				return { ...candidate, sha256, status: 'APPLIED' };
+			}
+			if (state.created[sha256]) {
+				return { ...candidate, sha256, status: 'CREATED' };
+			}
+
+			try {
+				await this.gitService.validatePatch(repositoryPath, candidate.path);
+			} catch (error) {
+				return {
+					...candidate,
+					sha256,
+					status: 'INVALID',
+					error: this.getErrorMessage(error),
+				};
+			}
+
+			try {
+				await this.gitService.checkPatch(repositoryPath, candidate.path);
+				return { ...candidate, sha256, status: 'READY' };
+			} catch (forwardError) {
+				try {
+					await this.gitService.checkPatchReverse(repositoryPath, candidate.path);
+					return {
+						...candidate,
+						sha256,
+						status: 'APPLIED',
+					};
+				} catch {
+					return {
+						...candidate,
+						sha256,
+						status: 'CONFLICT',
+						error: this.getErrorMessage(forwardError),
+					};
+				}
+			}
 		} catch (error) {
 			return {
 				...candidate,
 				status: 'INVALID',
-				error: `Could not read patch file: ${this.getErrorMessage(error)}`,
-			};
-		}
-
-		if (state.applied[sha256]) {
-			return { ...candidate, sha256, status: 'APPLIED' };
-		}
-		if (state.created[sha256]) {
-			return { ...candidate, sha256, status: 'CREATED' };
-		}
-
-		try {
-			await this.gitService.validatePatch(repositoryPath, candidate.path);
-		} catch (error) {
-			return {
-				...candidate,
-				sha256,
-				status: 'INVALID',
-				error: this.getErrorMessage(error),
-			};
-		}
-
-		try {
-			await this.gitService.checkPatch(repositoryPath, candidate.path);
-			return { ...candidate, sha256, status: 'READY' };
-		} catch (error) {
-			return {
-				...candidate,
-				sha256,
-				status: 'CONFLICT',
 				error: this.getErrorMessage(error),
 			};
 		}

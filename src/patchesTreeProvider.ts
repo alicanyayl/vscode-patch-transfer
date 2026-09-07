@@ -1,4 +1,4 @@
-import { resolve } from 'path';
+import { basename, resolve } from 'path';
 import * as vscode from 'vscode';
 import { GitService } from './gitService';
 import { PatchFile, PatchService, PatchStatus } from './patchService';
@@ -14,6 +14,8 @@ interface PatchPresentation {
 export class PatchTreeItem extends vscode.TreeItem {
 	constructor(readonly patch: PatchFile, undoable = false, gapWarning?: string) {
 		super(patch.name, vscode.TreeItemCollapsibleState.None);
+		this.id = patch.path;
+		this.resourceUri = vscode.Uri.file(patch.path);
 		const presentation = getPatchPresentation(patch.status);
 
 		this.description = gapWarning
@@ -67,6 +69,8 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 		private readonly rollbackService?: RollbackService,
 	) {}
 
+	private lastRepositoryPath: string | undefined;
+
 	get count(): number {
 		return this.patchCount;
 	}
@@ -80,9 +84,12 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 		return this.patches.find(patch => this.normalizePath(patch.path) === normalizedPath);
 	}
 
-	async refresh(): Promise<void> {
+	async refresh(targetRepositoryPath?: string): Promise<void> {
 		const generation = ++this.refreshGeneration;
-		const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+		if (targetRepositoryPath) {
+			this.lastRepositoryPath = targetRepositoryPath;
+		}
+		const workspacePath = targetRepositoryPath ?? this.lastRepositoryPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 		const repositoryContext = workspacePath
 			? await this.gitService.getRepositoryContext(workspacePath)
 			: { status: 'notRepository' as const };
@@ -95,6 +102,7 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 		let refreshError: string | undefined;
 
 		if (repositoryPath) {
+			this.lastRepositoryPath = repositoryPath;
 			try {
 				patches = await this.patchService.listPatches(repositoryPath);
 				state = patches.length === 0 ? 'empty' : 'patches';
@@ -180,7 +188,7 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 			];
 		}
 
-		if (state === 'error') {
+		if (state === 'error' && patches.length === 0) {
 			return [
 				new MessageTreeItem(
 					'Patch state unavailable',
@@ -264,4 +272,127 @@ function getPatchPresentation(status: PatchStatus): PatchPresentation {
 				),
 			};
 	}
+}
+
+export function isPatchTreeItem(value: unknown): value is PatchTreeItem {
+	if (value instanceof PatchTreeItem) {
+		return true;
+	}
+	if (typeof value === 'object' && value !== null && 'patch' in value) {
+		const candidate = (value as { patch: unknown }).patch;
+		return (
+			typeof candidate === 'object' &&
+			candidate !== null &&
+			'path' in candidate &&
+			typeof (candidate as { path: unknown }).path === 'string'
+		);
+	}
+	return false;
+}
+
+export function isPatchFile(value: unknown): value is PatchFile {
+	return (
+		typeof value === 'object' &&
+		value !== null &&
+		'path' in value &&
+		typeof (value as PatchFile).path === 'string' &&
+		'status' in value &&
+		typeof (value as PatchFile).status === 'string'
+	);
+}
+
+function extractCandidate(input: unknown): { path?: string; patch?: PatchFile } | undefined {
+	if (input === undefined || input === null) {
+		return undefined;
+	}
+	if (Array.isArray(input)) {
+		return input.length > 0 ? extractCandidate(input[0]) : undefined;
+	}
+	if (isPatchTreeItem(input)) {
+		return { path: input.patch.path, patch: input.patch };
+	}
+	if (isPatchFile(input)) {
+		return { path: input.path, patch: input };
+	}
+	if (typeof input === 'string') {
+		return { path: input };
+	}
+	if (input instanceof vscode.Uri) {
+		return { path: input.fsPath };
+	}
+	if (typeof input === 'object') {
+		const obj = input as Record<string, unknown>;
+		if (obj.resourceUri instanceof vscode.Uri) {
+			return { path: obj.resourceUri.fsPath };
+		}
+		if (obj.resourceUri && typeof obj.resourceUri === 'object' && 'fsPath' in obj.resourceUri) {
+			return { path: (obj.resourceUri as { fsPath: string }).fsPath };
+		}
+		if (typeof obj.fsPath === 'string') {
+			return { path: obj.fsPath };
+		}
+		if (obj.patch && typeof obj.patch === 'object') {
+			return extractCandidate(obj.patch);
+		}
+		if (typeof obj.path === 'string') {
+			return { path: obj.path };
+		}
+		if (typeof obj.id === 'string' && obj.id.toLowerCase().endsWith('.patch')) {
+			return { path: obj.id };
+		}
+	}
+	return undefined;
+}
+
+export function resolveTargetPatch(
+	argument: unknown,
+	selectedItem: unknown,
+	currentPatchFinder?: (path: string) => PatchFile | undefined,
+): PatchFile | undefined {
+	// Priority 1: Explicit TreeItem or command argument passed by VS Code
+	const explicitTarget = extractCandidate(argument);
+	if (explicitTarget) {
+		if (explicitTarget.path) {
+			const found = currentPatchFinder?.(explicitTarget.path);
+			if (found) {
+				return found;
+			}
+		}
+		if (explicitTarget.patch) {
+			return explicitTarget.patch;
+		}
+		if (explicitTarget.path) {
+			return {
+				name: basename(explicitTarget.path),
+				path: explicitTarget.path,
+				status: 'READY',
+				timestamp: new Date(),
+			};
+		}
+	}
+
+	// Priority 2: Current TreeView selection (or active tracked selection)
+	const selectionTarget = extractCandidate(selectedItem);
+	if (selectionTarget) {
+		if (selectionTarget.path) {
+			const found = currentPatchFinder?.(selectionTarget.path);
+			if (found) {
+				return found;
+			}
+		}
+		if (selectionTarget.patch) {
+			return selectionTarget.patch;
+		}
+		if (selectionTarget.path) {
+			return {
+				name: basename(selectionTarget.path),
+				path: selectionTarget.path,
+				status: 'READY',
+				timestamp: new Date(),
+			};
+		}
+	}
+
+	// Priority 3: No target found -> returns undefined so caller shows warning
+	return undefined;
 }

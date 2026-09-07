@@ -31,6 +31,8 @@ When developing software for secure, offline, or air-gapped environments:
 - **Non-Destructive Patch Preview**: Inspect affected files, change types (add/edit/delete/rename), and line statistics without modifying working-tree files.
 - **Safe Patch Application**: Applies patches safely using Git mechanics without requiring matching branch histories.
 - **Pre-Apply Snapshots & Rollback (Undo Last Patch)**: Automatically captures byte-exact snapshots of affected files before applying, enabling complete restoration of the previous state.
+- **Interactive Conflict Resolver**: Git-like side-by-side resolver panel for `CONFLICT` patches. Choose between `CURRENT (TARGET)` and `PATCH (INCOMING)`, view diffs, or resolve manually with zero project mutation until final apply.
+- **Safe Partial Conflict Application**: Clean non-conflicting files and hunks apply automatically alongside explicitly chosen conflict resolutions.
 - **Post-Apply Fingerprint Protection**: Detects if files were manually modified after patch application and prompts before undoing.
 - **Professional Conflict Diagnostics**: Identifies conflicting files, lines, and causes (e.g., context mismatch, missing files) with clean virtual document details and clipboard export.
 - **Patch Chain Metadata & Gap Detection**: Links sequential patches linearly and warns if an imported patch is missing its predecessor.
@@ -74,15 +76,18 @@ When developing software for secure, offline, or air-gapped environments:
 
 ---
 
-## Conflict Diagnostics
+## Conflict Diagnostics & Resolution
 
 When a patch cannot apply cleanly against the current state of destination files:
 - The patch is classified as `CONFLICT`.
-- Click **Conflict Details** (`$(issues)`) to view a comprehensive diagnostic report detailing which files conflict, line numbers, and specific reasons (e.g., context mismatch, missing target file, file already exists).
-- Click **Copy Conflict Diagnostics** to export a clean report to your clipboard.
-
-> [!NOTE]
-> Patch Transfer diagnoses conflicts with high precision. It does not perform automatic conflict resolution.
+- Click **Conflict Details** (`$(issues)`) to view a comprehensive read-only diagnostic report detailing which files conflict, line numbers, and specific causes (e.g., context mismatch, missing target file, file already exists).
+- Click **Resolve Conflicts** (`$(git-merge)`) to launch the interactive **Patch Conflict Resolver**.
+- For each conflicting hunk, compare `CURRENT (TARGET)` against `PATCH (INCOMING)` and choose:
+  - **Keep Current**: Preserve the local project's existing code for this hunk.
+  - **Use Patch Change**: Apply the incoming patch hunk (enabled when deterministic anchors exist).
+  - **Open Diff**: Inspect side-by-side virtual diffs in VS Code's native diff editor.
+  - **Resolve Manually**: Safely edit a temporary resolution candidate and mark resolved.
+- When ready, click **Apply Resolved Patch** to transactionally write all clean and resolved changes with pre-apply snapshot protection.
 
 ---
 
@@ -112,7 +117,7 @@ Patches and sidecar metadata files can be transported using USB drives, secure r
 
 ## Limitations
 
-- Automatic conflict resolution is not implemented; manual alignment or prerequisite patching is recommended.
+- When an incoming hunk cannot be mapped safely or unambiguously to the target file, Patch Transfer requires manual resolution instead of guessing.
 - Rollback restoration is available for the most recently applied patch with valid snapshot data.
 - Git must be installed on both source and destination machines.
 

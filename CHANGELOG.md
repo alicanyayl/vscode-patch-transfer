@@ -2,6 +2,17 @@
 
 All notable changes to the **Patch Transfer** extension will be documented in this file.
 
+## [0.2.0] - 2026-09-04
+
+### Added
+- **Interactive Conflict Resolver**: Webview panel providing Git-like side-by-side interactive resolution for conflicting patches.
+- **Git-Like Current vs Patch Choices**: Review conflicts with clear `CURRENT (TARGET)` versus `PATCH (INCOMING)` presentation and deterministic choices (`Keep Current`, `Use Patch Change`, `Open Diff`, `Resolve Manually`).
+- **Safe Partial Conflict Resolution**: Isolated sandbox partial-apply analysis (`git apply --reject` in private internal Git storage) automatically applies non-conflicting files and hunks without modifying the real project during resolution.
+- **Manual Resolution Workflow**: Safely edit candidate files pre-populated with clean hunks in a temporary workspace and mark resolved before final application.
+- **Transactional Resolved Apply**: Rollback snapshot capture prior to final apply ensures atomic application or automatic rollback upon failure.
+- **Full Undo Integration**: Conflict-resolved patches seamlessly support `Undo Last Patch` and audit history tracking.
+- **Deterministic Hunk Safety & Ambiguity Guard**: Unambiguous, anchor-validated hunks can be applied with one click; ambiguous or unanchored hunks require manual resolution instead of guessing.
+
 ## [0.1.0] - 2026-08-31
 
 ### Added
