@@ -1,4 +1,4 @@
-import { execFile } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import { isAbsolute, resolve } from 'path';
 import { promisify } from 'util';
 
@@ -197,5 +197,39 @@ export class GitService {
 
 	async getCurrentBranch(repositoryPath: string): Promise<string> {
 		return this.runGit(repositoryPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
+	}
+
+	async getLocalConfig(repositoryPath: string, key: string): Promise<string | undefined> {
+		try {
+			const stdout = await this.runGit(repositoryPath, ['config', '--local', '--get', key]);
+			return stdout.trim() || undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	async setLocalConfig(repositoryPath: string, key: string, value: string): Promise<void> {
+		await this.runGit(repositoryPath, ['config', '--local', key, value]);
+	}
+
+	getLocalConfigSync(repositoryPath: string, key: string): string | undefined {
+		try {
+			const stdout = execFileSync(this.gitExecutable, ['config', '--local', '--get', key], {
+				cwd: repositoryPath,
+				encoding: 'utf8',
+				windowsHide: true,
+			});
+			return stdout.trim() || undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	setLocalConfigSync(repositoryPath: string, key: string, value: string): void {
+		execFileSync(this.gitExecutable, ['config', '--local', key, value], {
+			cwd: repositoryPath,
+			encoding: 'utf8',
+			windowsHide: true,
+		});
 	}
 }

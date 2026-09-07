@@ -1,10 +1,12 @@
 import * as assert from 'assert';
 import { execFile } from 'child_process';
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { promisify } from 'util';
+import { AuditHistoryService } from '../auditHistoryService';
 import { GitService } from '../gitService';
+import { PatchMetadataService } from '../patchMetadataService';
 import { PatchService } from '../patchService';
 import { PatchStateService } from '../patchStateService';
 import {
@@ -197,6 +199,398 @@ suite('Persistent transfer folder workflow', function () {
 				'READY',
 			);
 		}
+	});
+
+	test('1. First explicit transfer-folder selection is persisted', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'repo-1', 'base\n');
+		const transferDir = join(root, 'transfer-1');
+		await mkdir(transferDir, { recursive: true });
+		const gitService = new GitService();
+		const folders = new TransferFolderService(gitService);
+
+		let pickerCalls = 0;
+		const selected = await folders.getOrSelect(repository, async () => {
+			pickerCalls += 1;
+			return transferDir;
+		});
+
+		assert.strictEqual(selected, resolve(transferDir));
+		assert.strictEqual(pickerCalls, 1);
+		assert.strictEqual(folders.get(repository), resolve(transferDir));
+		assert.strictEqual(
+			await gitService.getLocalConfig(repository, 'patchTransfer.transferFolder'),
+			resolve(transferDir),
+		);
+	});
+
+	test('2. Subsequent Create Patch reuses it without picker', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'repo-2', 'base\n');
+		const transferDir = join(root, 'transfer-2');
+		await mkdir(transferDir, { recursive: true });
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const folders = new TransferFolderService(gitService);
+		await folders.set(repository, transferDir);
+		const workflow = new TransferWorkflowService(folders, patchService);
+
+		await writeFile(join(repository, 'target.txt'), 'new content\n', 'utf8');
+		const patchResult = await patchService.createPatch(repository, 'feat: test 2');
+		if (patchResult.status === 'noChanges') {
+			assert.fail('Should have changes');
+		}
+
+		const transferResult = await workflow.transferCreatedPatch(
+			repository,
+			patchResult.patchPath,
+			async () => {
+				assert.fail('Picker should not be called when transfer folder is already configured');
+			},
+		);
+
+		assert.strictEqual(transferResult.status, 'copied');
+		assert.strictEqual(transferResult.folderPath, resolve(transferDir));
+	});
+
+	test('3. Subsequent Import Patch reuses it without picker', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source-3', 'base\n');
+		const destination = await createRepository(root, 'dest-3', 'base\n');
+		const transferDir = join(root, 'transfer-3');
+		await mkdir(transferDir, { recursive: true });
+		await createPatch(source, transferDir, 'p3.patch', 'patch content\n');
+
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const folders = new TransferFolderService(gitService);
+		await folders.set(destination, transferDir);
+		const workflow = new TransferWorkflowService(folders, patchService);
+
+		const importResult = await workflow.importAvailablePatches(
+			destination,
+			async () => {
+				assert.fail('Picker should not be called when transfer folder is already configured');
+			},
+		);
+
+		assert.strictEqual(importResult.status, 'completed');
+		assert.strictEqual(importResult.folderPath, resolve(transferDir));
+		assert.strictEqual(importResult.result.imported.length, 1);
+	});
+
+	test('4. Explicit Set Transfer Folder changes it', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'repo-4', 'base\n');
+		const folderA = join(root, 'transfer-4a');
+		const folderB = join(root, 'transfer-4b');
+		await mkdir(folderA, { recursive: true });
+		await mkdir(folderB, { recursive: true });
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const folders = new TransferFolderService(gitService);
+		await folders.set(repository, folderA);
+		const workflow = new TransferWorkflowService(folders, patchService);
+
+		assert.strictEqual(folders.get(repository), resolve(folderA));
+
+		const newSelected = await workflow.setTransferFolder(repository, async () => folderB);
+		assert.strictEqual(newSelected, resolve(folderB));
+		assert.strictEqual(folders.get(repository), resolve(folderB));
+		assert.strictEqual(
+			await gitService.getLocalConfig(repository, 'patchTransfer.transferFolder'),
+			resolve(folderB),
+		);
+	});
+
+	test('5. No other operation changes it', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'repo-5', 'base\n');
+		const transferDir = join(root, 'transfer-5');
+		await mkdir(transferDir, { recursive: true });
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const folders = new TransferFolderService(gitService);
+		await folders.set(repository, transferDir);
+
+		await patchService.listPatches(repository);
+		assert.strictEqual(folders.get(repository), resolve(transferDir));
+	});
+
+	test('6. Repository is moved to a different absolute filesystem path: configured Transfer Folder survives', async () => {
+		const root = await createTemporaryDirectory();
+		const origRepo = await createRepository(root, 'orig-repo-6', 'base\n');
+		const transferDir = join(root, 'transfer-6');
+		await mkdir(transferDir, { recursive: true });
+		const gitService = new GitService();
+		const folders = new TransferFolderService(gitService);
+		await folders.set(origRepo, transferDir);
+		assert.strictEqual(folders.get(origRepo), resolve(transferDir));
+
+		// Move repository to another location
+		const movedRepo = join(root, 'moved-repo-6');
+		await rename(origRepo, movedRepo);
+
+		const newService = new TransferFolderService(gitService);
+		assert.strictEqual(newService.get(movedRepo), resolve(transferDir));
+	});
+
+	test('7. New VS Code workspace state / new MemoryMemento: repository-local Transfer Folder still survives', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'repo-7', 'base\n');
+		const transferDir = join(root, 'transfer-7');
+		await mkdir(transferDir, { recursive: true });
+		const gitService = new GitService();
+
+		const memento1 = new MemoryMemento();
+		const folders1 = new TransferFolderService(gitService, memento1);
+		await folders1.set(repository, transferDir);
+
+		// Fresh session with empty memento (new workspace)
+		const memento2 = new MemoryMemento();
+		const folders2 = new TransferFolderService(gitService, memento2);
+		assert.strictEqual(folders2.get(repository), resolve(transferDir));
+	});
+
+	test('8. Legacy workspaceState value migrates once when possible', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'repo-8', 'base\n');
+		const legacyDir = join(root, 'legacy-transfer-8');
+		await mkdir(legacyDir, { recursive: true });
+		const gitService = new GitService();
+
+		// Populate legacy memento
+		const memento = new MemoryMemento();
+		const normalized = process.platform === 'win32' ? resolve(repository).toLowerCase() : resolve(repository);
+		await memento.update('patchTransfer.transferFolders', { [normalized]: resolve(legacyDir) });
+
+		assert.strictEqual(
+			await gitService.getLocalConfig(repository, 'patchTransfer.transferFolder'),
+			undefined,
+		);
+
+		const folders = new TransferFolderService(gitService, memento);
+		const resolved = folders.get(repository);
+		assert.strictEqual(resolved, resolve(legacyDir));
+
+		// Verify migrated into Git local config
+		assert.strictEqual(
+			await gitService.getLocalConfig(repository, 'patchTransfer.transferFolder'),
+			resolve(legacyDir),
+		);
+	});
+
+	test('9. Missing USB/folder: operation fails clearly, configured folder is NOT cleared or changed', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'repo-9', 'base\n');
+		const missingDir = join(root, 'missing-usb-drive-9');
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const folders = new TransferFolderService(gitService);
+		await folders.set(repository, missingDir);
+		const workflow = new TransferWorkflowService(folders, patchService);
+
+		const patchPath = join(root, 'sample.patch');
+		await writeFile(patchPath, 'diff\n', 'utf8');
+
+		await assert.rejects(
+			async () => workflow.transferCreatedPatch(repository, patchPath, async () => {
+				assert.fail('Picker should not be called');
+			}),
+			(error: Error) => {
+				assert.ok(
+					error.message.includes(`Transfer folder is currently unavailable:\n${resolve(missingDir)}`),
+					`Expected unavailable message but got: ${error.message}`,
+				);
+				assert.ok(error.message.includes('Use "Set Transfer Folder" to change it.'));
+				return true;
+			},
+		);
+
+		// Configured folder remains unchanged
+		assert.strictEqual(folders.get(repository), resolve(missingDir));
+	});
+
+	test('10. Folder becomes available again: existing configured value is reused automatically', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'repo-10', 'base\n');
+		const usbDir = join(root, 'usb-reconnect-10');
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const folders = new TransferFolderService(gitService);
+		await folders.set(repository, usbDir);
+		const workflow = new TransferWorkflowService(folders, patchService);
+
+		const patchPath = join(root, 'sample10.patch');
+		await writeFile(patchPath, 'diff10\n', 'utf8');
+
+		// USB reconnects / directory becomes available
+		await mkdir(usbDir, { recursive: true });
+
+		const result = await workflow.transferCreatedPatch(repository, patchPath, async () => {
+			assert.fail('Picker should not be called');
+		});
+
+		assert.strictEqual(result.status, 'copied');
+		assert.strictEqual(result.folderPath, resolve(usbDir));
+	});
+
+	test('11. Source Create Patch with transfer unavailable: local patch still exists', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'repo-11', 'base\n');
+		const missingDir = join(root, 'missing-usb-11');
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const folders = new TransferFolderService(gitService);
+		await folders.set(repository, missingDir);
+		const workflow = new TransferWorkflowService(folders, patchService);
+
+		await writeFile(join(repository, 'target.txt'), 'created for test 11\n', 'utf8');
+		const createResult = await patchService.createPatch(repository, 'feat: test 11');
+		if (createResult.status === 'noChanges') {
+			assert.fail('Should have created patch');
+		}
+
+		await assert.rejects(
+			async () => workflow.transferCreatedPatch(repository, createResult.patchPath, async () => {
+				assert.fail('Picker should not be called');
+			}),
+			/Transfer folder is currently unavailable:/,
+		);
+
+		const localContent = await readFile(createResult.patchPath, 'utf8');
+		assert.ok(localContent.length > 0);
+	});
+
+	test('12. Source Create Patch with available transfer folder: exact patch bytes + matching sidecar are copied', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'repo-12', 'base\n');
+		const transferDir = join(root, 'transfer-12');
+		await mkdir(transferDir, { recursive: true });
+		const gitService = new GitService();
+		const stateService = new PatchStateService(gitService);
+		const metadataService = new PatchMetadataService(gitService);
+		const historyService = new AuditHistoryService(gitService);
+		const patchService = new PatchService(gitService, stateService, undefined, metadataService, historyService);
+		const folders = new TransferFolderService(gitService);
+		await folders.set(repository, transferDir);
+		const workflow = new TransferWorkflowService(folders, patchService);
+
+		await writeFile(join(repository, 'target.txt'), 'created for test 12\n', 'utf8');
+		const createResult = await patchService.createPatch(repository, 'feat: test 12');
+		if (createResult.status === 'noChanges') {
+			assert.fail('Should have created patch');
+		}
+
+		const transferResult = await workflow.transferCreatedPatch(
+			repository,
+			createResult.patchPath,
+			async () => assert.fail('Should not pick'),
+		);
+
+		assert.strictEqual(transferResult.status, 'copied');
+		const localBytes = await readFile(createResult.patchPath);
+		const transferredBytes = await readFile(transferResult.destinationPath);
+		assert.deepStrictEqual(transferredBytes, localBytes);
+
+		const sidecarPath = join(transferDir, `${createResult.patchName}meta.json`);
+		const sidecarContent = await readFile(sidecarPath, 'utf8');
+		assert.ok(sidecarContent.includes(await stateService.calculatePatchSha256(createResult.patchPath)));
+	});
+
+	test('13. Target Import from configured folder: direct valid .patch is imported to target .patch-transfer', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source-13', 'base\n');
+		const destination = await createRepository(root, 'dest-13', 'base\n');
+		const transferDir = join(root, 'transfer-13');
+		await mkdir(transferDir, { recursive: true });
+		await createPatch(source, transferDir, 'valid13.patch', 'change 13\n');
+
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const folders = new TransferFolderService(gitService);
+		await folders.set(destination, transferDir);
+		const workflow = new TransferWorkflowService(folders, patchService);
+
+		const result = await workflow.importAvailablePatches(destination, async () => {
+			assert.fail('Should not prompt');
+		});
+
+		assert.strictEqual(result.status, 'completed');
+		assert.strictEqual(result.result.imported.length, 1);
+		const importedPath = join(destination, '.patch-transfer', 'valid13.patch');
+		assert.ok(await readFile(importedPath, 'utf8'));
+	});
+
+	test('14. Imported patch is visible from PatchService/Patches provider immediately after refresh', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source-14', 'base\n');
+		const destination = await createRepository(root, 'dest-14', 'base\n');
+		const transferDir = join(root, 'transfer-14');
+		await mkdir(transferDir, { recursive: true });
+		await createPatch(source, transferDir, 'valid14.patch', 'change 14\n');
+
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const folders = new TransferFolderService(gitService);
+		await folders.set(destination, transferDir);
+		const workflow = new TransferWorkflowService(folders, patchService);
+
+		await workflow.importAvailablePatches(destination, async () => assert.fail('Should not prompt'));
+
+		const patches = await patchService.listPatches(destination);
+		const found = patches.find(p => p.name === 'valid14.patch');
+		assert.ok(found);
+		assert.strictEqual(found.status, 'READY');
+	});
+
+	test('15. Duplicate patch import remains deduplicated', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source-15', 'base\n');
+		const destination = await createRepository(root, 'dest-15', 'base\n');
+		const transferDir = join(root, 'transfer-15');
+		await mkdir(transferDir, { recursive: true });
+		await createPatch(source, transferDir, 'dedup15.patch', 'change 15\n');
+
+		const gitService = new GitService();
+		const patchService = new PatchService(gitService);
+		const folders = new TransferFolderService(gitService);
+		await folders.set(destination, transferDir);
+		const workflow = new TransferWorkflowService(folders, patchService);
+
+		const first = await workflow.importAvailablePatches(destination, async () => assert.fail('No pick'));
+		assert.strictEqual(first.status, 'completed');
+		assert.strictEqual(first.result.imported.length, 1);
+
+		const second = await workflow.importAvailablePatches(destination, async () => assert.fail('No pick'));
+		assert.strictEqual(second.status, 'completed');
+		assert.strictEqual(second.result.imported.length, 0);
+		assert.strictEqual(second.result.alreadyExists.length, 1);
+	});
+
+	test('16. Repo A and Repo B maintain independent settings', async () => {
+		const root = await createTemporaryDirectory();
+		const repoA = await createRepository(root, 'repo-16a', 'base\n');
+		const repoB = await createRepository(root, 'repo-16b', 'base\n');
+		const transferA = join(root, 'transfer-16a');
+		const transferB = join(root, 'transfer-16b');
+		await mkdir(transferA, { recursive: true });
+		await mkdir(transferB, { recursive: true });
+
+		const gitService = new GitService();
+		const folders = new TransferFolderService(gitService);
+		await folders.set(repoA, transferA);
+		await folders.set(repoB, transferB);
+
+		assert.strictEqual(folders.get(repoA), resolve(transferA));
+		assert.strictEqual(folders.get(repoB), resolve(transferB));
+
+		const transferA2 = join(root, 'transfer-16a2');
+		await mkdir(transferA2, { recursive: true });
+		await folders.set(repoA, transferA2);
+
+		assert.strictEqual(folders.get(repoA), resolve(transferA2));
+		assert.strictEqual(folders.get(repoB), resolve(transferB));
 	});
 
 	async function createTemporaryDirectory(): Promise<string> {

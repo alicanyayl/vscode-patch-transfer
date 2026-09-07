@@ -932,9 +932,9 @@ suite('Patch application workflow', function () {
 		assert.strictEqual(result.status, 'stateSaveFailed');
 		assert.strictEqual(
 			await readFile(join(destination, 'target.txt'), 'utf8'),
-			'applied without state\n',
+			'base\n',
 		);
-		assert.strictEqual((await new PatchService(gitService).listPatches(destination))[0].status, 'APPLIED');
+		assert.strictEqual((await new PatchService(gitService).listPatches(destination))[0].status, 'READY');
 	});
 
 	test('stores state in the actual Git directory for a worktree', async () => {

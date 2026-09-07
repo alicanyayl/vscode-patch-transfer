@@ -301,6 +301,21 @@ export class RollbackService {
 		}
 	}
 
+	async restoreFromSnapshotDirectory(
+		repositoryPath: string,
+		snapshotDirectory: string,
+	): Promise<void> {
+		const manifest = await this.readManifest(snapshotDirectory);
+		const beforeDirectory = join(snapshotDirectory, 'before');
+		await this.performRestore(repositoryPath, manifest.paths, beforeDirectory);
+	}
+
+	async getSnapshotPaths(repositoryPath: string, patchSha: string): Promise<string[]> {
+		const backupDirectory = await this.getBackupDirectory(repositoryPath, patchSha);
+		const manifest = await this.readManifest(backupDirectory);
+		return manifest.paths.map(entry => entry.path);
+	}
+
 	async deleteSnapshot(repositoryPath: string, patchSha: string): Promise<void> {
 		const backupDirectory = await this.getBackupDirectory(repositoryPath, patchSha);
 		try {

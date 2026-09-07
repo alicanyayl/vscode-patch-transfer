@@ -596,6 +596,7 @@ export class ConflictResolutionService {
 			);
 		}
 
+		let snapshotFinalized = false;
 		// 4. Transactionally copy resolved candidate files to real project
 		try {
 			for (const relPath of session.affectedPaths) {
@@ -627,22 +628,15 @@ export class ConflictResolutionService {
 				}
 			}
 		} catch (writeError) {
-			// Transaction failure: restore pre-apply state from the temp snapshot.
-			// Note: The temp snapshot has not been finalized yet, so we must
-			// restore directly from the temp directory's 'before' contents
-			// rather than calling restoreSnapshot (which looks in the finalized location).
 			if (tempSnapshotDirectory) {
 				try {
-					// Finalize first so restoreSnapshot can find it
-					await this.rollbackService.finalizeSnapshot(
+					await this.rollbackService.restoreFromSnapshotDirectory(
 						repositoryPath,
-						session.patchSha,
 						tempSnapshotDirectory,
 					);
-					await this.rollbackService.restoreSnapshot(repositoryPath, session.patchSha);
+					await this.rollbackService.cleanupTempSnapshot(tempSnapshotDirectory);
 				} catch {
-					// If finalize+restore also fails, clean up temp as last resort
-					await this.rollbackService.cleanupTempSnapshot(tempSnapshotDirectory).catch(() => {});
+					// Preserve temp snapshot if restoration fails
 				}
 			}
 			throw new Error(
@@ -657,8 +651,19 @@ export class ConflictResolutionService {
 				session.patchSha,
 				tempSnapshotDirectory,
 			);
+			snapshotFinalized = true;
 		} catch (error) {
-			await this.rollbackService.cleanupTempSnapshot(tempSnapshotDirectory);
+			if (tempSnapshotDirectory) {
+				try {
+					await this.rollbackService.restoreFromSnapshotDirectory(
+						repositoryPath,
+						tempSnapshotDirectory,
+					);
+					await this.rollbackService.cleanupTempSnapshot(tempSnapshotDirectory);
+				} catch {
+					// Preserve temp snapshot if restoration fails
+				}
+			}
 			throw new Error(
 				`Rollback finalization failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
@@ -706,11 +711,25 @@ export class ConflictResolutionService {
 		}
 
 		// 7. Save applied state
-		await this.stateService.recordApplied(
-			repositoryPath,
-			session.patchSha,
-			session.patchFileName,
-		);
+		try {
+			await this.stateService.recordApplied(
+				repositoryPath,
+				session.patchSha,
+				session.patchFileName,
+			);
+		} catch (stateError) {
+			if (snapshotFinalized) {
+				try {
+					await this.rollbackService.restoreSnapshot(repositoryPath, session.patchSha);
+					await this.rollbackService.deleteSnapshot(repositoryPath, session.patchSha);
+				} catch {
+					// Preserve snapshot if restoration fails
+				}
+			}
+			throw new Error(
+				`Failed to record applied state: ${stateError instanceof Error ? stateError.message : String(stateError)}`,
+			);
+		}
 
 		// 8. Record audit event with resolution summary
 		await this.historyService.recordEvent(repositoryPath, {

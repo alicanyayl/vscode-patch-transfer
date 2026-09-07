@@ -7,6 +7,8 @@ import { promisify } from 'util';
 import { AuditHistoryService } from '../auditHistoryService';
 import { ConflictResolutionService } from '../conflictResolutionService';
 import { GitService } from '../gitService';
+import * as vscode from 'vscode';
+import { getAuthoritativePackageVersion, PatchMetadataService } from '../patchMetadataService';
 import { PatchFile, PatchService } from '../patchService';
 import { PatchStateService } from '../patchStateService';
 import { RollbackService } from '../rollbackService';
@@ -737,6 +739,511 @@ suite('Patches Tree Provider and Selection Regression Tests', function () {
 		const finalContent = await readFile(join(destination, 'target.txt'), 'utf8');
 		assert.ok(finalContent.includes('const A = "custom_A";'), 'Conflict 1 must have custom manual result');
 		assert.ok(finalContent.includes('const B = "target_B";'), 'Conflict 2 must preserve current target');
+	});
+
+	test('23. Normal Apply: finalizeSnapshot fails after git apply -> original working tree restored exactly', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source', 'original content\n', 'base');
+		const destination = await createRepository(root, 'destination', 'original content\n', 'base');
+		const patchPath = await createPatch(source, destination, 'p23.patch', 'modified content\n');
+
+		const gitService = new GitService();
+		const stateService = new PatchStateService(gitService);
+		const failingRollback = new class extends RollbackService {
+			override async finalizeSnapshot(
+				repositoryPath: string,
+				patchSha: string,
+				tempDirectory: string,
+			): Promise<void> {
+				void repositoryPath;
+				void patchSha;
+				void tempDirectory;
+				throw new Error('injected finalizeSnapshot failure');
+			}
+		}(gitService);
+		const patchService = new PatchService(gitService, stateService, failingRollback);
+
+		const result = await patchService.applyPatch(destination, patchPath);
+		assert.strictEqual(result.status, 'applyFailed');
+		assert.ok(result.error.includes('injected finalizeSnapshot failure'));
+
+		// Working tree must be restored to exact original content
+		const content = await readFile(join(destination, 'target.txt'), 'utf8');
+		assert.strictEqual(content, 'original content\n');
+
+		// Not marked as applied
+		const state = await stateService.load(destination);
+		assert.strictEqual(Object.keys(state.applied).length, 0);
+	});
+
+	test('24. Normal Apply: recordApplied fails -> original working tree restored exactly', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source', 'original content 24\n', 'base');
+		const destination = await createRepository(root, 'destination', 'original content 24\n', 'base');
+		const patchPath = await createPatch(source, destination, 'p24.patch', 'modified content 24\n');
+
+		const gitService = new GitService();
+		const failingState = new class extends PatchStateService {
+			override async recordApplied(
+				repositoryPath: string,
+				sha256: string,
+				fileName: string,
+				appliedAt?: Date,
+			): Promise<void> {
+				void repositoryPath;
+				void sha256;
+				void fileName;
+				void appliedAt;
+				throw new Error('injected recordApplied failure');
+			}
+		}(gitService);
+		const patchService = new PatchService(gitService, failingState);
+
+		const result = await patchService.applyPatch(destination, patchPath);
+		assert.strictEqual(result.status, 'stateSaveFailed');
+
+		// Exact original working tree restored
+		const content = await readFile(join(destination, 'target.txt'), 'utf8');
+		assert.strictEqual(content, 'original content 24\n');
+
+		// Not in applied state
+		const patches = await new PatchService(gitService).listPatches(destination);
+		assert.strictEqual(patches[0].status, 'READY');
+	});
+
+	test('25. Normal Apply: binary file + post-apply failure -> exact original bytes restored', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source', 'base\n', 'base');
+		const destination = await createRepository(root, 'destination', 'base\n', 'base');
+
+		const binaryOriginal = Buffer.from([0, 150, 200, 255, 1, 2, 3]);
+		const binaryModified = Buffer.from([0, 150, 200, 255, 99, 88, 77]);
+		await writeFile(join(source, 'image.bin'), binaryOriginal);
+		await writeFile(join(destination, 'image.bin'), binaryOriginal);
+		await runGit(source, ['add', 'image.bin']);
+		await runGit(source, ['commit', '-m', 'add binary']);
+		await runGit(destination, ['add', 'image.bin']);
+		await runGit(destination, ['commit', '-m', 'add binary']);
+
+		// Modify binary in source and create patch
+		await writeFile(join(source, 'image.bin'), binaryModified);
+		const patchDirectory = join(destination, '.patch-transfer');
+		const patchPath = join(patchDirectory, 'binary.patch');
+		await mkdir(patchDirectory, { recursive: true });
+		await runGit(source, [
+			'diff',
+			'--binary',
+			'--full-index',
+			'--no-color',
+			'HEAD',
+			`--output=${patchPath}`,
+		]);
+
+		const gitService = new GitService();
+		const failingState = new class extends PatchStateService {
+			override async recordApplied(): Promise<void> {
+				throw new Error('injected failure');
+			}
+		}(gitService);
+		const patchService = new PatchService(gitService, failingState);
+
+		const result = await patchService.applyPatch(destination, patchPath);
+		assert.strictEqual(result.status, 'stateSaveFailed');
+
+		// Exact original binary bytes restored
+		const restoredBinary = await readFile(join(destination, 'image.bin'));
+		assert.deepStrictEqual(restoredBinary, binaryOriginal);
+	});
+
+	test('26. Normal Apply: added file + post-apply failure -> added file removed again', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source', 'base\n', 'base');
+		const destination = await createRepository(root, 'destination', 'base\n', 'base');
+
+		// Add new file in source and generate patch
+		await writeFile(join(source, 'newfile.txt'), 'new file content\n', 'utf8');
+		await runGit(source, ['add', 'newfile.txt']);
+		const patchDirectory = join(destination, '.patch-transfer');
+		const patchPath = join(patchDirectory, 'added.patch');
+		await mkdir(patchDirectory, { recursive: true });
+		await runGit(source, [
+			'diff',
+			'--cached',
+			'--binary',
+			'--full-index',
+			'--no-color',
+			`--output=${patchPath}`,
+		]);
+
+		const gitService = new GitService();
+		const failingState = new class extends PatchStateService {
+			override async recordApplied(): Promise<void> {
+				throw new Error('injected failure');
+			}
+		}(gitService);
+		const patchService = new PatchService(gitService, failingState);
+
+		const result = await patchService.applyPatch(destination, patchPath);
+		assert.strictEqual(result.status, 'stateSaveFailed');
+
+		// Added file must be removed
+		let exists = true;
+		try {
+			await readFile(join(destination, 'newfile.txt'));
+		} catch {
+			exists = false;
+		}
+		assert.strictEqual(exists, false);
+	});
+
+	test('27. Normal Apply: deleted file + post-apply failure -> deleted file restored exactly', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source', 'base\n', 'base');
+		const destination = await createRepository(root, 'destination', 'base\n', 'base');
+
+		await writeFile(join(source, 'to_delete.txt'), 'content to delete\n', 'utf8');
+		await writeFile(join(destination, 'to_delete.txt'), 'content to delete\n', 'utf8');
+		await runGit(source, ['add', 'to_delete.txt']);
+		await runGit(source, ['commit', '-m', 'add to_delete']);
+		await runGit(destination, ['add', 'to_delete.txt']);
+		await runGit(destination, ['commit', '-m', 'add to_delete']);
+
+		// Delete in source and make patch
+		await rm(join(source, 'to_delete.txt'));
+		const patchDirectory = join(destination, '.patch-transfer');
+		const patchPath = join(patchDirectory, 'deleted.patch');
+		await mkdir(patchDirectory, { recursive: true });
+		await runGit(source, [
+			'diff',
+			'--binary',
+			'--full-index',
+			'--no-color',
+			'HEAD',
+			`--output=${patchPath}`,
+		]);
+
+		const gitService = new GitService();
+		const failingState = new class extends PatchStateService {
+			override async recordApplied(): Promise<void> {
+				throw new Error('injected failure');
+			}
+		}(gitService);
+		const patchService = new PatchService(gitService, failingState);
+
+		const result = await patchService.applyPatch(destination, patchPath);
+		assert.strictEqual(result.status, 'stateSaveFailed');
+
+		// Deleted file must be restored
+		const content = await readFile(join(destination, 'to_delete.txt'), 'utf8');
+		assert.strictEqual(content, 'content to delete\n');
+	});
+
+	test('28. Resolved Apply: snapshot finalization fails after candidate files were written -> original project restored exactly', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source', 'base\n', 'base');
+		const destination = await createRepository(root, 'destination', 'original destination text\n', 'base');
+		const patchPath = await createPatch(source, destination, 'res_fail.patch', 'incoming patch\n');
+
+		const gitService = new GitService();
+		const stateService = new PatchStateService(gitService);
+		const failingRollback = new class extends RollbackService {
+			override async finalizeSnapshot(
+				repositoryPath: string,
+				patchSha: string,
+				tempDirectory: string,
+			): Promise<void> {
+				void repositoryPath;
+				void patchSha;
+				void tempDirectory;
+				throw new Error('injected finalize failure in resolve');
+			}
+		}(gitService);
+		const historyService = new AuditHistoryService(gitService);
+		const resolutionService = new ConflictResolutionService(gitService, failingRollback, stateService, historyService);
+
+		const session = await resolutionService.startSession(destination, patchPath);
+		const file = session.files[0];
+		await resolutionService.setHunkResolution(session, file.hunks[0].id, 'current');
+
+		await assert.rejects(
+			async () => resolutionService.applyResolved(session, destination),
+			/Rollback finalization failed: injected finalize failure in resolve/,
+		);
+
+		// Real destination file must still have its exact original content
+		const content = await readFile(join(destination, 'target.txt'), 'utf8');
+		assert.strictEqual(content, 'original destination text\n');
+	});
+
+	test('29. Resolved Apply: recordApplied fails -> original project restored exactly', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source', 'base\n', 'base');
+		const destination = await createRepository(root, 'destination', 'original destination text 29\n', 'base');
+		const patchPath = await createPatch(source, destination, 'res_fail29.patch', 'incoming patch\n');
+
+		const gitService = new GitService();
+		const failingState = new class extends PatchStateService {
+			override async recordApplied(): Promise<void> {
+				throw new Error('injected recordApplied failure in resolve');
+			}
+		}(gitService);
+		const rollbackService = new RollbackService(gitService);
+		const historyService = new AuditHistoryService(gitService);
+		const resolutionService = new ConflictResolutionService(gitService, rollbackService, failingState, historyService);
+
+		const session = await resolutionService.startSession(destination, patchPath);
+		const file = session.files[0];
+		await resolutionService.setHunkResolution(session, file.hunks[0].id, 'current');
+
+		await assert.rejects(
+			async () => resolutionService.applyResolved(session, destination),
+			/Failed to record applied state: injected recordApplied failure in resolve/,
+		);
+
+		// Real destination file must still have its exact original content
+		const content = await readFile(join(destination, 'target.txt'), 'utf8');
+		assert.strictEqual(content, 'original destination text 29\n');
+	});
+
+	test('30. Undo: removeApplied fails -> state/files/snapshot remain in consistent recoverable STATE A', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source', 'base content\n', 'base');
+		const destination = await createRepository(root, 'destination', 'base content\n', 'base');
+		const patchPath = await createPatch(source, destination, 'undo_fail.patch', 'patched content 30\n');
+
+		const gitService = new GitService();
+		const rollbackService = new RollbackService(gitService);
+		let failRemove = false;
+		const stateService = new class extends PatchStateService {
+			override async removeApplied(repositoryPath: string, sha256: string): Promise<void> {
+				if (failRemove) {
+					throw new Error('injected removeApplied failure');
+				}
+				return super.removeApplied(repositoryPath, sha256);
+			}
+		}(gitService);
+		const historyService = new AuditHistoryService(gitService);
+		const patchService = new PatchService(gitService, stateService, rollbackService, undefined, historyService);
+
+		// 1. Normal apply succeeds
+		const applyResult = await patchService.applyPatch(destination, patchPath);
+		assert.strictEqual(applyResult.status, 'applied');
+		assert.strictEqual(await readFile(join(destination, 'target.txt'), 'utf8'), 'patched content 30\n');
+
+		const sha256 = await stateService.calculatePatchSha256(patchPath);
+
+		// 2. Enable failure on removeApplied and invoke undo
+		failRemove = true;
+		await assert.rejects(
+			async () => patchService.undoPatch(destination, sha256),
+			/injected removeApplied failure/,
+		);
+
+		// Verified STATE A:
+		// - File content is STILL the applied content
+		assert.strictEqual(await readFile(join(destination, 'target.txt'), 'utf8'), 'patched content 30\n');
+		// - APPLIED state still exists
+		const state = await stateService.load(destination);
+		assert.ok(state.applied[sha256]);
+		// - Rollback snapshot still exists
+		assert.strictEqual(await rollbackService.hasSnapshot(destination, sha256), true);
+	});
+
+	test('31. Undo: successful path restores pre-apply state and removes applied (STATE B)', async () => {
+		const root = await createTemporaryDirectory();
+		const source = await createRepository(root, 'source', 'base content 31\n', 'base');
+		const destination = await createRepository(root, 'destination', 'base content 31\n', 'base');
+		const patchPath = await createPatch(source, destination, 'undo_ok.patch', 'patched content 31\n');
+
+		const gitService = new GitService();
+		const rollbackService = new RollbackService(gitService);
+		const stateService = new PatchStateService(gitService);
+		const historyService = new AuditHistoryService(gitService);
+		const patchService = new PatchService(gitService, stateService, rollbackService, undefined, historyService);
+
+		// Apply
+		const applyResult = await patchService.applyPatch(destination, patchPath);
+		assert.strictEqual(applyResult.status, 'applied');
+		const sha256 = await stateService.calculatePatchSha256(patchPath);
+
+		// Undo
+		await patchService.undoPatch(destination, sha256);
+
+		// Verified STATE B:
+		// - File restored to base content
+		assert.strictEqual(await readFile(join(destination, 'target.txt'), 'utf8'), 'base content 31\n');
+		// - APPLIED state removed
+		const state = await stateService.load(destination);
+		assert.strictEqual(state.applied[sha256], undefined);
+		// - Rollback snapshot deleted
+		assert.strictEqual(await rollbackService.hasSnapshot(destination, sha256), false);
+	});
+
+	test('32. Inline action: selected A, clicked READY B -> B is targeted', async () => {
+		const root = await createTemporaryDirectory();
+		const patchA: PatchFile = {
+			name: 'A.patch',
+			path: join(root, 'A.patch'),
+			timestamp: new Date(),
+			status: 'CONFLICT',
+		};
+		const patchB: PatchFile = {
+			name: 'B.patch',
+			path: join(root, 'B.patch'),
+			timestamp: new Date(),
+			status: 'READY',
+		};
+
+		const itemA = new PatchTreeItem(patchA);
+		const itemB = new PatchTreeItem(patchB);
+
+		// Patch A is selected, user clicks inline Apply on Patch B
+		const resolved = resolveTargetPatch(itemB, itemA, path => path.includes('B.patch') ? patchB : patchA);
+		assert.strictEqual(resolved?.name, 'B.patch');
+		assert.strictEqual(resolved?.status, 'READY');
+	});
+
+	test('33. Inline conflict action: selected A, clicked CONFLICT B -> B is targeted', async () => {
+		const root = await createTemporaryDirectory();
+		const patchA: PatchFile = {
+			name: 'A.patch',
+			path: join(root, 'A.patch'),
+			timestamp: new Date(),
+			status: 'READY',
+		};
+		const patchB: PatchFile = {
+			name: 'B.patch',
+			path: join(root, 'B.patch'),
+			timestamp: new Date(),
+			status: 'CONFLICT',
+		};
+
+		const itemA = new PatchTreeItem(patchA);
+		const itemB = new PatchTreeItem(patchB);
+
+		// Patch A is selected, user clicks inline Conflict Details on Patch B
+		const resolved = resolveTargetPatch(itemB, itemA, path => path.includes('B.patch') ? patchB : patchA);
+		assert.strictEqual(resolved?.name, 'B.patch');
+		assert.strictEqual(resolved?.status, 'CONFLICT');
+	});
+
+	test('34. metadata.extensionVersion matches actual extension version from package.json', async () => {
+		const root = await createTemporaryDirectory();
+		const repository = await createRepository(root, 'source', 'base\n', 'base');
+		await writeFile(join(repository, 'target.txt'), 'changed for package version\n', 'utf8');
+
+		const gitService = new GitService();
+		const stateService = new PatchStateService(gitService);
+		const metadataService = new PatchMetadataService(gitService);
+		// Note: no hardcoded version passed to PatchService
+		const patchService = new PatchService(
+			gitService,
+			stateService,
+			undefined,
+			metadataService,
+		);
+
+		const result = await patchService.createPatch(repository, 'feat: check dynamic version');
+		if (result.status === 'noChanges') {
+			assert.fail('Should create patch');
+		}
+
+		const sidecar = await metadataService.readSidecar(result.patchPath);
+		assert.ok(sidecar);
+		assert.strictEqual(sidecar.version, 1, 'Schema version must remain 1');
+		const expectedVersion = getAuthoritativePackageVersion();
+		assert.notStrictEqual(expectedVersion, 'unknown', 'Package version should resolve from package.json');
+		assert.strictEqual(sidecar.extensionVersion, expectedVersion, `extensionVersion must match package version ${expectedVersion}`);
+	});
+
+	test('35. Undo UI command is registered and delegates to PatchService.undoPatch', async () => {
+		const packagePath = resolve(__dirname, '..', '..', 'package.json');
+		const packageJson = JSON.parse(await readFile(packagePath, 'utf8')) as {
+			activationEvents: string[];
+			contributes: {
+				commands: Array<{ command: string; title: string }>;
+				menus: {
+					'view/item/context': Array<{ command: string; when: string }>;
+				};
+			};
+		};
+
+		assert.ok(
+			packageJson.activationEvents.includes('onCommand:patch-transfer.undoLastPatch'),
+			'onCommand:patch-transfer.undoLastPatch must be in activationEvents',
+		);
+		const undoCommand = packageJson.contributes.commands.find(
+			c => c.command === 'patch-transfer.undoLastPatch',
+		);
+		assert.ok(undoCommand, 'patch-transfer.undoLastPatch must be in contributes.commands');
+
+		const inlineUndo = packageJson.contributes.menus['view/item/context'].find(
+			m => m.command === 'patch-transfer.undoLastPatch',
+		);
+		assert.ok(inlineUndo, 'patch-transfer.undoLastPatch must be in view/item/context');
+		assert.match(inlineUndo.when, /patchTransfer\.patch\.applied\.undoable/);
+
+		const ext = vscode.extensions.getExtension('Alicanyayl.patch-transfer')
+			?? vscode.extensions.getExtension('alicanyayl.patch-transfer');
+		if (ext) {
+			if (!ext.isActive) {
+				await ext.activate();
+			}
+			const commands = await vscode.commands.getCommands(true);
+			assert.ok(
+				commands.includes('patch-transfer.undoLastPatch'),
+				'patch-transfer.undoLastPatch command must be registered in VS Code',
+			);
+		}
+
+		// Verify extension.ts source code delegates exclusively to transactional undoPatch
+		const extensionTsPath = resolve(__dirname, '..', '..', 'src', 'extension.ts');
+		const extensionSource = await readFile(extensionTsPath, 'utf8');
+		const undoHandlerMatch = extensionSource.match(
+			/registerCommand\('patch-transfer\.undoLastPatch'[\s\S]*?\}\),/,
+		);
+		assert.ok(undoHandlerMatch, 'undoLastPatch command registration must exist in extension.ts');
+		assert.ok(
+			undoHandlerMatch[0].includes('undoPatch('),
+			'undoLastPatch must call patchService.undoPatch',
+		);
+		assert.ok(
+			!undoHandlerMatch[0].includes('restoreSnapshot(') &&
+			!undoHandlerMatch[0].includes('deleteSnapshot(') &&
+			!undoHandlerMatch[0].includes('removeApplied('),
+			'undoLastPatch handler must NOT contain manual restoreSnapshot/removeApplied/deleteSnapshot sequence',
+		);
+
+		let undoPatchCalled = false;
+		const originalUndoPatch = PatchService.prototype.undoPatch;
+		try {
+			PatchService.prototype.undoPatch = async function (repo, sha) {
+				undoPatchCalled = true;
+				return originalUndoPatch.call(this, repo, sha);
+			};
+
+			const root = await createTemporaryDirectory();
+			const source = await createRepository(root, 'source-undo-wiring', 'base\n', 'base');
+			const destination = await createRepository(root, 'dest-undo-wiring', 'base\n', 'base');
+			const patchPath = await createPatch(source, destination, 'undo_wiring.patch', 'base\nadded\n');
+
+			const gitService = new GitService();
+			const rollbackService = new RollbackService(gitService);
+			const stateService = new PatchStateService(gitService);
+			const patchService = new PatchService(gitService, stateService, rollbackService);
+
+			const applyRes = await patchService.applyPatch(destination, patchPath);
+			assert.strictEqual(applyRes.status, 'applied');
+
+			const latestSha = await stateService.getLatestAppliedSha(destination);
+			assert.ok(latestSha);
+
+			await patchService.undoPatch(destination, latestSha);
+			assert.strictEqual(undoPatchCalled, true, 'PatchService.undoPatch must be executed');
+			assert.strictEqual(await readFile(join(destination, 'target.txt'), 'utf8'), 'base\n');
+		} finally {
+			PatchService.prototype.undoPatch = originalUndoPatch;
+		}
 	});
 
 

@@ -1,6 +1,7 @@
 import { randomBytes } from 'crypto';
+import { readFileSync } from 'fs';
 import { access, mkdir, readFile, rename, writeFile } from 'fs/promises';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
 import { GitService } from './gitService';
 import { PatchState } from './patchStateService';
 
@@ -30,6 +31,23 @@ export function getPatchMetadataFileName(patchFileName: string): string {
 	return patchFileName.endsWith('.patch')
 		? `${patchFileName.slice(0, -6)}.patchmeta.json`
 		: `${patchFileName}.patchmeta.json`;
+}
+
+export function getAuthoritativePackageVersion(explicitVersion?: string): string {
+	if (typeof explicitVersion === 'string' && explicitVersion.trim()) {
+		return explicitVersion.trim();
+	}
+	try {
+		const packageJsonPath = resolve(__dirname, '..', 'package.json');
+		const content = readFileSync(packageJsonPath, 'utf8');
+		const parsed = JSON.parse(content) as { version?: unknown };
+		if (typeof parsed.version === 'string' && parsed.version.trim()) {
+			return parsed.version.trim();
+		}
+	} catch {
+		// Fallback to safe neutral indicator if package.json cannot be read
+	}
+	return 'unknown';
 }
 
 export class PatchMetadataService {
@@ -180,7 +198,7 @@ export class PatchMetadataService {
 				deletions: typeof stats.deletions === 'number' ? stats.deletions : undefined,
 			} : undefined,
 			paths,
-			extensionVersion: typeof data.extensionVersion === 'string' ? data.extensionVersion : '0.1.0',
+			extensionVersion: typeof data.extensionVersion === 'string' ? data.extensionVersion : getAuthoritativePackageVersion(),
 		};
 	}
 

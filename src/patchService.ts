@@ -19,6 +19,7 @@ import { AuditHistoryService } from './auditHistoryService';
 import { parseConflictDiagnostics, PatchConflictDiagnostic } from './conflictDiagnostics';
 import { PatchDetailsPresentation } from './patchDetailsPreviewProvider';
 import {
+	getAuthoritativePackageVersion,
 	getPatchMetadataFileName,
 	PatchMetadata,
 	PatchMetadataService,
@@ -100,6 +101,7 @@ export class PatchService {
 	private readonly metadataService: PatchMetadataService;
 	private readonly historyService: AuditHistoryService;
 	private readonly resolutionService: ConflictResolutionService;
+	private readonly extensionVersion: string;
 
 	constructor(
 		private readonly gitService: GitService,
@@ -108,6 +110,7 @@ export class PatchService {
 		metadataService?: PatchMetadataService,
 		historyService?: AuditHistoryService,
 		resolutionService?: ConflictResolutionService,
+		extensionVersion?: string,
 	) {
 		this.stateService = stateService ?? new PatchStateService(gitService);
 		// Ensure a single RollbackService instance is shared between PatchService
@@ -121,6 +124,7 @@ export class PatchService {
 			this.stateService,
 			this.historyService,
 		);
+		this.extensionVersion = getAuthoritativePackageVersion(extensionVersion);
 	}
 
 	getResolutionService(): ConflictResolutionService {
@@ -138,6 +142,7 @@ export class PatchService {
 		patchPath: string,
 		destinationDirectory: string,
 	): Promise<CopyPatchResult> {
+		await this.ensureTransferDirectoryAvailable(destinationDirectory);
 		const sourceSha256 = await this.stateService.calculatePatchSha256(patchPath);
 		const result = await this.transferPatchFile(
 			patchPath,
@@ -258,6 +263,7 @@ export class PatchService {
 		workspacePath: string,
 		transferDirectory: string,
 	): Promise<ImportPatchesResult> {
+		await this.ensureTransferDirectoryAvailable(transferDirectory);
 		const entries = await readdir(transferDirectory, { withFileTypes: true });
 		const patchNames = entries
 			.filter(entry => entry.isFile() && extname(entry.name).toLowerCase() === '.patch')
@@ -395,7 +401,7 @@ export class PatchService {
 					deletions,
 				},
 				paths,
-				extensionVersion: '0.1.0',
+				extensionVersion: this.extensionVersion,
 			};
 
 			try {
@@ -676,6 +682,7 @@ export class PatchService {
 
 		// Create pre-apply snapshot.
 		let tempSnapshotDirectory: string | undefined;
+		let snapshotFinalized = false;
 		try {
 			const affectedPaths = await this.rollbackService.resolveAffectedPaths(
 				repositoryPath,
@@ -699,7 +706,15 @@ export class PatchService {
 			await this.gitService.applyPatch(repositoryPath, safePatchPath);
 		} catch (error) {
 			if (tempSnapshotDirectory) {
-				await this.rollbackService.cleanupTempSnapshot(tempSnapshotDirectory);
+				try {
+					await this.rollbackService.restoreFromSnapshotDirectory(
+						repositoryPath,
+						tempSnapshotDirectory,
+					);
+					await this.rollbackService.cleanupTempSnapshot(tempSnapshotDirectory);
+				} catch {
+					// Preserve temp snapshot if restoration fails
+				}
 			}
 			return {
 				status: 'applyFailed',
@@ -716,8 +731,17 @@ export class PatchService {
 					sha256,
 					tempSnapshotDirectory,
 				);
+				snapshotFinalized = true;
 			} catch (error) {
-				await this.rollbackService.cleanupTempSnapshot(tempSnapshotDirectory);
+				try {
+					await this.rollbackService.restoreFromSnapshotDirectory(
+						repositoryPath,
+						tempSnapshotDirectory,
+					);
+					await this.rollbackService.cleanupTempSnapshot(tempSnapshotDirectory);
+				} catch {
+					// Preserve temp snapshot if restoration fails
+				}
 				return {
 					status: 'applyFailed',
 					patchName,
@@ -736,12 +760,76 @@ export class PatchService {
 			});
 			return { status: 'applied', patchName };
 		} catch (error) {
+			if (snapshotFinalized) {
+				try {
+					await this.rollbackService.restoreSnapshot(repositoryPath, sha256);
+					await this.rollbackService.deleteSnapshot(repositoryPath, sha256);
+				} catch {
+					// Preserve snapshot if restoration fails
+				}
+			}
 			return {
 				status: 'stateSaveFailed',
 				patchName,
 				error: this.getErrorMessage(error),
 			};
 		}
+	}
+
+	async undoPatch(repositoryPath: string, patchSha: string): Promise<void> {
+		if (!(await this.rollbackService.hasSnapshot(repositoryPath, patchSha))) {
+			throw new Error('No rollback snapshot available for this patch.');
+		}
+
+		const state = await this.stateService.load(repositoryPath);
+		const patchFileName = state.applied[patchSha]?.fileName ?? `${patchSha}.patch`;
+
+		// 1. Create a recovery snapshot of the currently applied state
+		// in case removeApplied fails after files are restored
+		const affectedPaths = await this.rollbackService.getSnapshotPaths(
+			repositoryPath,
+			patchSha,
+		);
+		const recoverySnapshotDir = await this.rollbackService.createSnapshot(
+			repositoryPath,
+			`undo-recovery-${patchSha}`,
+			patchFileName,
+			affectedPaths,
+		);
+
+		// 2. Restore pre-apply files
+		await this.rollbackService.restoreSnapshot(repositoryPath, patchSha);
+
+		// 3. Remove applied state
+		try {
+			await this.stateService.removeApplied(repositoryPath, patchSha);
+		} catch (removeError) {
+			// removeApplied failed: restore files back to applied state (STATE A)
+			try {
+				await this.rollbackService.restoreFromSnapshotDirectory(
+					repositoryPath,
+					recoverySnapshotDir,
+				);
+				await this.rollbackService.cleanupTempSnapshot(recoverySnapshotDir);
+			} catch {
+				// Preserve recovery snapshot if restoration fails
+			}
+			throw removeError;
+		}
+
+		// 4. Cleanup temporary recovery snapshot
+		await this.rollbackService.cleanupTempSnapshot(recoverySnapshotDir);
+
+		// 5. Delete the rollback snapshot
+		await this.rollbackService.deleteSnapshot(repositoryPath, patchSha);
+
+		// 6. Record audit event
+		await this.historyService.recordEvent(repositoryPath, {
+			timestamp: new Date().toISOString(),
+			event: 'UNDONE',
+			patchSha256: patchSha,
+			patchFileName,
+		});
 	}
 
 	private async ensureLocalExclude(repositoryPath: string): Promise<void> {
@@ -1094,5 +1182,23 @@ export class PatchService {
 
 	private isAlreadyExistsError(error: unknown): boolean {
 		return (error as NodeJS.ErrnoException).code === 'EEXIST';
+	}
+
+	private async ensureTransferDirectoryAvailable(directoryPath: string): Promise<void> {
+		try {
+			const info = await stat(directoryPath);
+			if (!info.isDirectory()) {
+				throw new Error(
+					`Transfer folder is currently unavailable:\n${directoryPath}\n\nUse "Set Transfer Folder" to change it.`,
+				);
+			}
+		} catch (error) {
+			if (error instanceof Error && error.message.includes('Transfer folder is currently unavailable:')) {
+				throw error;
+			}
+			throw new Error(
+				`Transfer folder is currently unavailable:\n${directoryPath}\n\nUse "Set Transfer Folder" to change it.`,
+			);
+		}
 	}
 }

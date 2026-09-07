@@ -1,4 +1,6 @@
+import { stat } from 'fs/promises';
 import { resolve } from 'path';
+import { GitService } from './gitService';
 import {
 	CopyPatchResult,
 	ImportPatchesResult,
@@ -6,6 +8,7 @@ import {
 } from './patchService';
 
 const transferFoldersStateKey = 'patchTransfer.transferFolders';
+export const gitConfigTransferFolderKey = 'patchTransfer.transferFolder';
 
 export interface TransferFolderMemento {
 	get<T>(key: string): T | undefined;
@@ -23,16 +26,77 @@ export type FolderImportResult =
 	| { status: 'completed'; folderPath: string; result: ImportPatchesResult };
 
 export class TransferFolderService {
-	constructor(private readonly workspaceState: TransferFolderMemento) {}
+	private readonly gitService: GitService;
+	private readonly workspaceState?: TransferFolderMemento;
+
+	constructor(
+		gitServiceOrMemento?: GitService | TransferFolderMemento,
+		workspaceState?: TransferFolderMemento,
+	) {
+		if (gitServiceOrMemento && 'getRepositoryContext' in gitServiceOrMemento) {
+			this.gitService = gitServiceOrMemento as GitService;
+			this.workspaceState = workspaceState;
+		} else {
+			this.gitService = new GitService();
+			this.workspaceState = gitServiceOrMemento as TransferFolderMemento | undefined;
+		}
+	}
 
 	get(repositoryPath: string): string | undefined {
-		return this.readFolders()[this.normalizeRepositoryPath(repositoryPath)];
+		// 1. Authoritative: check repository-local Git config
+		try {
+			const gitValue = this.gitService.getLocalConfigSync(
+				repositoryPath,
+				gitConfigTransferFolderKey,
+			);
+			if (gitValue) {
+				return resolve(gitValue);
+			}
+		} catch {
+			// Ignore Git lookup errors (e.g. not a Git repo)
+		}
+
+		// 2. Backward-compatible check in legacy workspaceState
+		const legacyFolders = this.readLegacyFolders();
+		const legacyValue = legacyFolders[this.normalizeRepositoryPath(repositoryPath)];
+		if (legacyValue) {
+			const resolved = resolve(legacyValue);
+			// One-way migration into repository-local Git config
+			try {
+				this.gitService.setLocalConfigSync(
+					repositoryPath,
+					gitConfigTransferFolderKey,
+					resolved,
+				);
+			} catch {
+				// Best-effort migration
+			}
+			return resolved;
+		}
+
+		return undefined;
 	}
 
 	async set(repositoryPath: string, folderPath: string): Promise<void> {
-		const folders = this.readFolders();
-		folders[this.normalizeRepositoryPath(repositoryPath)] = resolve(folderPath);
-		await this.workspaceState.update(transferFoldersStateKey, folders);
+		const resolvedFolder = resolve(folderPath);
+
+		// 1. Authoritative: write to repository-local Git config
+		try {
+			await this.gitService.setLocalConfig(
+				repositoryPath,
+				gitConfigTransferFolderKey,
+				resolvedFolder,
+			);
+		} catch {
+			// Fallback if not a Git repository (e.g. non-git synthetic test environments)
+		}
+
+		// 2. Also keep workspaceState updated if available
+		if (this.workspaceState) {
+			const folders = this.readLegacyFolders();
+			folders[this.normalizeRepositoryPath(repositoryPath)] = resolvedFolder;
+			await this.workspaceState.update(transferFoldersStateKey, folders);
+		}
 	}
 
 	async select(repositoryPath: string, picker: TransferFolderPicker): Promise<string | undefined> {
@@ -52,7 +116,11 @@ export class TransferFolderService {
 		return this.get(repositoryPath) ?? this.select(repositoryPath, picker);
 	}
 
-	private readFolders(): Record<string, string> {
+	private readLegacyFolders(): Record<string, string> {
+		if (!this.workspaceState) {
+			return {};
+		}
+
 		const stored = this.workspaceState.get<unknown>(transferFoldersStateKey);
 		if (!stored || typeof stored !== 'object' || Array.isArray(stored)) {
 			return {};
@@ -94,6 +162,8 @@ export class TransferWorkflowService {
 			return { status: 'cancelled' };
 		}
 
+		await this.ensureFolderAvailable(folderPath);
+
 		return {
 			folderPath,
 			...await this.patchService.copyPatchToDirectory(patchPath, folderPath),
@@ -109,6 +179,8 @@ export class TransferWorkflowService {
 			return { status: 'cancelled' };
 		}
 
+		await this.ensureFolderAvailable(folderPath);
+
 		return {
 			status: 'completed',
 			folderPath,
@@ -117,5 +189,23 @@ export class TransferWorkflowService {
 				folderPath,
 			),
 		};
+	}
+
+	private async ensureFolderAvailable(folderPath: string): Promise<void> {
+		try {
+			const info = await stat(folderPath);
+			if (!info.isDirectory()) {
+				throw new Error(
+					`Transfer folder is currently unavailable:\n${folderPath}\n\nUse "Set Transfer Folder" to change it.`,
+				);
+			}
+		} catch (error) {
+			if (error instanceof Error && error.message.includes('Transfer folder is currently unavailable:')) {
+				throw error;
+			}
+			throw new Error(
+				`Transfer folder is currently unavailable:\n${folderPath}\n\nUse "Set Transfer Folder" to change it.`,
+			);
+		}
 	}
 }

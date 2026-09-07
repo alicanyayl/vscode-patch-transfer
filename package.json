@@ -95,8 +95,7 @@
         "title": "Apply this patch to the current project",
         "shortTitle": "Apply Patch",
         "category": "Patch Transfer",
-        "icon": "$(play)",
-        "enablement": "patchTransfer.patchReady"
+        "icon": "$(play)"
       },
       {
         "command": "patch-transfer.previewPatch",
@@ -108,8 +107,7 @@
       {
         "command": "patch-transfer.showPatchError",
         "title": "Show Patch Error",
-        "icon": "$(output)",
-        "enablement": "patchTransfer.patchHasError"
+        "icon": "$(output)"
       },
       {
         "command": "patch-transfer.undoLastPatch",

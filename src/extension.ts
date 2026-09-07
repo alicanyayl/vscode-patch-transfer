@@ -16,7 +16,7 @@ import { ConflictPreviewProvider } from './conflictPreviewProvider';
 import { formatConflictClipboardReport } from './conflictDiagnostics';
 import { HistoryPreviewProvider } from './historyPreviewProvider';
 import { PatchDetailsPreviewProvider } from './patchDetailsPreviewProvider';
-import { PatchMetadataService } from './patchMetadataService';
+import { getAuthoritativePackageVersion, PatchMetadataService } from './patchMetadataService';
 import { CreatePatchResult, PatchFile, PatchService } from './patchService';
 import { PatchPreviewProvider } from './patchPreviewProvider';
 import {
@@ -44,12 +44,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const stateService = new PatchStateService(gitService);
 	const auditHistoryService = new AuditHistoryService(gitService);
 	const metadataService = new PatchMetadataService(gitService);
+	const extensionVersion = context.extension?.packageJSON?.version ?? getAuthoritativePackageVersion();
 	const patchService = new PatchService(
 		gitService,
 		stateService,
 		undefined,
 		metadataService,
 		auditHistoryService,
+		undefined,
+		extensionVersion,
 	);
 	const rollbackService = new RollbackService(gitService);
 	const patchServiceWithRollback = new PatchService(
@@ -58,6 +61,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		rollbackService,
 		metadataService,
 		auditHistoryService,
+		undefined,
+		extensionVersion,
 	);
 	const patchPreviewProvider = new PatchPreviewProvider();
 	const conflictPreviewProvider = new ConflictPreviewProvider();
@@ -65,7 +70,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const patchDetailsPreviewProvider = new PatchDetailsPreviewProvider();
 	const conflictDiffProvider = new ConflictDiffProvider();
 	const conflictResolutionService = patchServiceWithRollback.getResolutionService();
-	const transferFolders = new TransferFolderService(context.workspaceState);
+	const transferFolders = new TransferFolderService(gitService, context.workspaceState);
 	const transferWorkflow = new TransferWorkflowService(transferFolders, patchService);
 	const patchesProvider = new PatchesTreeProvider(gitService, patchService, stateService, rollbackService);
 	const outputChannel = vscode.window.createOutputChannel('Patch Transfer');
@@ -851,9 +856,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 					}
 				}
 
-				const state = await stateService.load(repositoryPath);
-				const patchFileName = state.applied[latestSha]?.fileName ?? `${latestSha}.patch`;
-
 				await vscode.window.withProgress(
 					{
 						location: vscode.ProgressLocation.Notification,
@@ -861,15 +863,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 						cancellable: false,
 					},
 					async () => {
-						await rollbackService.restoreSnapshot(repositoryPath, latestSha);
-						await stateService.removeApplied(repositoryPath, latestSha);
-						await rollbackService.deleteSnapshot(repositoryPath, latestSha);
-						await auditHistoryService.recordEvent(repositoryPath, {
-							timestamp: new Date().toISOString(),
-							event: 'UNDONE',
-							patchSha256: latestSha,
-							patchFileName,
-						});
+						await patchServiceWithRollback.undoPatch(repositoryPath, latestSha);
 					},
 				);
 
