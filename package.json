@@ -50,6 +50,10 @@
     "onCommand:patch-transfer.refreshPatches",
     "onCommand:patch-transfer.createPatch",
     "onCommand:patch-transfer.importPatch",
+    "onCommand:patch-transfer.importPatchFile",
+    "onCommand:patch-transfer.selectRepository",
+    "onCommand:patch-transfer.openLocalPatchFolder",
+    "onCommand:patch-transfer.removeLocalPatch",
     "onCommand:patch-transfer.setTransferFolder",
     "onCommand:patch-transfer.previewPatch",
     "onCommand:patch-transfer.applyPatch",
@@ -81,8 +85,32 @@
       },
       {
         "command": "patch-transfer.importPatch",
-        "title": "Import Patch",
+        "title": "Import from Transfer Folder",
         "icon": "$(file-add)"
+      },
+      {
+        "command": "patch-transfer.importPatchFile",
+        "title": "Import Patch File...",
+        "category": "Patch Transfer",
+        "icon": "$(file)"
+      },
+      {
+        "command": "patch-transfer.selectRepository",
+        "title": "Select Patch Transfer Repository",
+        "category": "Patch Transfer",
+        "icon": "$(repo)"
+      },
+      {
+        "command": "patch-transfer.openLocalPatchFolder",
+        "title": "Open Local Patch Folder",
+        "category": "Patch Transfer",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "patch-transfer.removeLocalPatch",
+        "title": "Remove Local Patch",
+        "category": "Patch Transfer",
+        "icon": "$(trash)"
       },
       {
         "command": "patch-transfer.setTransferFolder",
@@ -95,6 +123,7 @@
         "title": "Apply this patch to the current project",
         "shortTitle": "Apply Patch",
         "category": "Patch Transfer",
+        "enablement": "true",
         "icon": "$(play)"
       },
       {
@@ -195,24 +224,39 @@
           "group": "navigation@1"
         },
         {
-          "command": "patch-transfer.refreshPatches",
+          "command": "patch-transfer.importPatchFile",
           "when": "view == patch-transfer.patches",
           "group": "navigation@2"
         },
         {
-          "command": "patch-transfer.setTransferFolder",
+          "command": "patch-transfer.refreshPatches",
           "when": "view == patch-transfer.patches",
           "group": "navigation@3"
         },
         {
+          "command": "patch-transfer.selectRepository",
+          "when": "view == patch-transfer.patches && patchTransfer.multipleRepositories",
+          "group": "navigation@4"
+        },
+        {
+          "command": "patch-transfer.openLocalPatchFolder",
+          "when": "view == patch-transfer.patches",
+          "group": "navigation@5"
+        },
+        {
+          "command": "patch-transfer.setTransferFolder",
+          "when": "view == patch-transfer.patches",
+          "group": "navigation@6"
+        },
+        {
           "command": "patch-transfer.undoLastPatch",
           "when": "view == patch-transfer.patches",
-          "group": "navigation@4"
+          "group": "navigation@7"
         },
         {
           "command": "patch-transfer.showHistory",
           "when": "view == patch-transfer.patches",
-          "group": "navigation@5"
+          "group": "navigation@8"
         }
       ],
       "view/item/context": [
@@ -250,6 +294,11 @@
           "command": "patch-transfer.undoLastPatch",
           "when": "view == patch-transfer.patches && viewItem == patchTransfer.patch.applied.undoable",
           "group": "inline@2"
+        },
+        {
+          "command": "patch-transfer.removeLocalPatch",
+          "when": "view == patch-transfer.patches && (viewItem == patchTransfer.patch.ready || viewItem == patchTransfer.patch.conflict || viewItem == patchTransfer.patch.created || viewItem == patchTransfer.patch.applied || viewItem == patchTransfer.patch.applied.undoable || viewItem == patchTransfer.patch.invalid)",
+          "group": "inline@9"
         }
       ]
     }

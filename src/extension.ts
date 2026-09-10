@@ -30,6 +30,10 @@ import { RollbackService } from './rollbackService';
 import { TransferFolderService, TransferWorkflowService } from './transferFolderService';
 import { ConflictDiffProvider } from './conflictDiffProvider';
 import { ConflictResolverPanel } from './conflictResolverPanel';
+import {
+	PatchTransferRepositoryContext,
+	RepositoryChoice,
+} from './repositoryContext';
 
 const ignoredWatchDirectories = new Set([
 	'.git',
@@ -41,6 +45,24 @@ const ignoredWatchDirectories = new Set([
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	const gitService = new GitService();
+	const gitRepositoryResolver = new VsCodeGitRepositoryResolver();
+	const repositoryContext = new PatchTransferRepositoryContext(
+		async () => {
+			const repositoryPaths = [...await gitRepositoryResolver.getRepositoryPaths()];
+			const workspaceContexts = await Promise.all(
+				(vscode.workspace.workspaceFolders ?? []).map(folder =>
+					gitService.getRepositoryContext(folder.uri.fsPath),
+				),
+			);
+			for (const workspaceContext of workspaceContexts) {
+				if (workspaceContext.status === 'repository') {
+					repositoryPaths.push(workspaceContext.repositoryPath);
+				}
+			}
+			return repositoryPaths;
+		},
+		() => vscode.window.activeTextEditor?.document.uri.fsPath,
+	);
 	const stateService = new PatchStateService(gitService);
 	const auditHistoryService = new AuditHistoryService(gitService);
 	const metadataService = new PatchMetadataService(gitService);
@@ -75,18 +97,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const patchesProvider = new PatchesTreeProvider(gitService, patchService, stateService, rollbackService);
 	const outputChannel = vscode.window.createOutputChannel('Patch Transfer');
 	const repositorySetupErrors = new Map<string, string>();
-	const gitRepositoryResolver = new VsCodeGitRepositoryResolver();
 	const commitMessageManager = new CommitMessageManager(
 		async () => {
-			const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-			if (!workspacePath) {
+			const repositoryPath = repositoryContext.repositoryPath;
+			if (!repositoryPath) {
 				return undefined;
 			}
-
-			const repositoryPath = await gitService.getRepositoryRoot(workspacePath);
-			return repositoryPath
-				? gitRepositoryResolver.resolve(repositoryPath)
-				: undefined;
+			return gitRepositoryResolver.resolve(repositoryPath);
 		},
 		{
 			getCommands: async () => vscode.commands.getCommands(true),
@@ -95,7 +112,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 	const changesModel = new ChangesViewModel(
 		gitService,
-		() => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+		() => repositoryContext.repositoryPath,
 	);
 	const changesViewProvider = new ChangesViewProvider(
 		context.extensionUri,
@@ -134,23 +151,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	};
 
 	await ensureActiveRepositorySetup();
-	await Promise.all([changesViewProvider.refreshChanges(), patchesProvider.refresh()]);
+	await repositoryContext.refresh();
+	await Promise.all([
+		changesViewProvider.refreshChanges(),
+		patchesProvider.refresh(repositoryContext.repositoryPath),
+	]);
 
 	const patchesView = vscode.window.createTreeView('patch-transfer.patches', {
 		treeDataProvider: patchesProvider,
 	});
 	const fileWatcher = vscode.workspace.createFileSystemWatcher('**/*');
 	const patchWatcher = vscode.workspace.createFileSystemWatcher(
-		'{**/.patch-transfer/*.patch,.patch-transfer/*.patch,**/*.patch}',
+		'{**/.patch-transfer/*.patch,.patch-transfer/*.patch}',
 	);
-	let activeOperation: 'creating' | 'applying' | 'importing' | 'undoing' | undefined;
+	let activeOperation: 'creating' | 'applying' | 'importing' | 'removing' | 'undoing' | undefined;
 	let changesRefreshTimer: NodeJS.Timeout | undefined;
 	let patchesRefreshTimer: NodeJS.Timeout | undefined;
 	let lastPatchRefreshError: string | undefined;
 	let selectedPatchItem: PatchTreeItem | undefined;
 
 	const setActiveOperation = (
-		operation: 'creating' | 'applying' | 'importing' | 'undoing' | undefined,
+		operation: 'creating' | 'applying' | 'importing' | 'removing' | 'undoing' | undefined,
 	) => {
 		activeOperation = operation;
 		changesViewProvider.setOperationBusy(operation !== undefined);
@@ -169,12 +190,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		await changesViewProvider.refreshChanges();
 	};
 
-	const refreshPatches = async (repositoryPath?: string) => {
-		const targetPath = repositoryPath ?? await getActiveRepositoryPath();
-		await patchesProvider.refresh(targetPath);
+	const refreshPatches = async () => {
+		await patchesProvider.refresh(repositoryContext.repositoryPath);
 		updateBadges();
-		const currentSelection = patchesView.selection[0] ?? selectedPatchItem;
-		updatePatchCommandContexts(currentSelection);
 		reportPatchRefreshError();
 	};
 
@@ -205,31 +223,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	};
 
 	const handleFileEvent = (uri: vscode.Uri) => {
-		const fsPath = uri.fsPath;
-		if (fsPath.toLowerCase().endsWith('.patch') || fsPath.includes('.patch-transfer')) {
-			schedulePatchesRefresh();
-		}
 		if (!shouldIgnoreFileEvent(uri)) {
 			scheduleChangesRefresh(uri);
 		}
 	};
 
-	function updatePatchCommandContexts(selectedItem?: vscode.TreeItem): void {
-		const targetItem = isPatchTreeItem(selectedItem) ? selectedItem : selectedPatchItem;
-		const selectedPatch = isPatchTreeItem(targetItem)
-			? (patchesProvider.getCurrentPatch(targetItem.patch.path) ?? targetItem.patch)
-			: undefined;
-		void vscode.commands.executeCommand(
-			'setContext',
-			'patchTransfer.patchReady',
-			selectedPatch?.status === 'READY',
-		);
-		void vscode.commands.executeCommand(
-			'setContext',
-			'patchTransfer.patchHasError',
-			selectedPatch?.status === 'CONFLICT' || selectedPatch?.status === 'INVALID',
-		);
-	}
+	const handlePatchFileEvent = (uri: vscode.Uri) => {
+		if (repositoryContext.isActiveLocalPatchFile(uri.fsPath)) {
+			schedulePatchesRefresh();
+		}
+	};
 
 	function reportPatchRefreshError(): void {
 		const error = patchesProvider.errorMessage;
@@ -285,25 +288,84 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		return selectedFolders?.[0]?.fsPath;
 	}
 
-	function showRepositoryRequirement(repositoryContext: GitRepositoryContext): void {
+	function showRepositoryRequirement(repositoryStatus: GitRepositoryContext): void {
 		vscode.window.showErrorMessage(
-			repositoryContext.status === 'missingGit'
+			repositoryStatus.status === 'missingGit'
 				? gitRequiredMessage
 				: repositoryRequiredMessage,
 		);
 	}
 
+	async function pickRepository(
+		repositories: readonly RepositoryChoice[],
+	): Promise<string | undefined> {
+		const selected = await vscode.window.showQuickPick(
+			repositories.map(repository => ({
+				label: repository.name,
+				description: repository.path,
+				repositoryPath: repository.path,
+			})),
+			{
+				placeHolder: 'Select the repository used by Patch Transfer',
+				title: 'Select Patch Transfer Repository',
+			},
+		);
+		return selected?.repositoryPath;
+	}
+
 	async function getActiveRepositoryPath(): Promise<string | undefined> {
-		const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-		const repositoryContext = workspacePath
-			? await gitService.getRepositoryContext(workspacePath)
-			: { status: 'notRepository' as const };
-		if (repositoryContext.status !== 'repository') {
-			showRepositoryRequirement(repositoryContext);
+		if (repositoryContext.repositoryPath) {
+			return repositoryContext.repositoryPath;
+		}
+
+		const repositoryPath = await repositoryContext.refresh({
+			promptIfAmbiguous: true,
+			picker: pickRepository,
+		});
+		if (repositoryPath) {
+			return repositoryPath;
+		}
+
+		// A cancelled ambiguous QuickPick is not a missing-repository error.
+		if (repositoryContext.repositoryCount > 1) {
 			return undefined;
 		}
 
-		return repositoryContext.repositoryPath;
+		let repositoryStatus: GitRepositoryContext = { status: 'notRepository' };
+		for (const folder of vscode.workspace.workspaceFolders ?? []) {
+			const candidateStatus = await gitService.getRepositoryContext(folder.uri.fsPath);
+			if (candidateStatus.status === 'missingGit') {
+				repositoryStatus = candidateStatus;
+				break;
+			}
+		}
+		showRepositoryRequirement(repositoryStatus);
+		return undefined;
+	}
+
+	function updateRepositoryPresentation(): void {
+		patchesView.description = repositoryContext.displayName;
+		void vscode.commands.executeCommand(
+			'setContext',
+			'patchTransfer.multipleRepositories',
+			repositoryContext.repositoryCount > 1,
+		);
+	}
+
+	async function refreshRepositoryViews(): Promise<void> {
+		selectedPatchItem = undefined;
+		updateRepositoryPresentation();
+		await Promise.all([
+			changesViewProvider.refreshRepository(),
+			changesViewProvider.refreshChanges(),
+			refreshPatches(),
+		]);
+	}
+
+	async function handleRepositorySetChanged(): Promise<void> {
+		await ensureActiveRepositorySetup();
+		await repositoryContext.refresh();
+		await refreshRepositoryViews();
 	}
 
 	function formatImportSummary(
@@ -330,14 +392,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	}
 
 	updateBadges();
-	updatePatchCommandContexts();
+	updateRepositoryPresentation();
 	reportPatchRefreshError();
 	const gitRepositoryListeners = await gitRepositoryResolver.registerRepositoryListeners(() => {
-		void Promise.all([
-			changesViewProvider.refreshRepository(),
-			changesViewProvider.refreshChanges(),
-		]);
+		void handleRepositorySetChanged();
 	});
+	const repositoryContextListener = repositoryContext.onDidChange(
+		updateRepositoryPresentation,
+	);
 
 	context.subscriptions.push(
 		changesViewProvider,
@@ -356,8 +418,44 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			changesViewProvider,
 		),
 		...gitRepositoryListeners,
+		repositoryContextListener,
 		patchesView,
 		outputChannel,
+		vscode.commands.registerCommand('patch-transfer.selectRepository', async () => {
+			if (activeOperation) {
+				vscode.window.showInformationMessage(
+					'Another Patch Transfer operation is already running.',
+				);
+				return;
+			}
+
+			const repositoryPath = await repositoryContext.select(pickRepository);
+			if (!repositoryPath) {
+				if (repositoryContext.repositoryCount === 0) {
+					showRepositoryRequirement({ status: 'notRepository' });
+				}
+				return;
+			}
+
+			await refreshRepositoryViews();
+		}),
+		vscode.commands.registerCommand('patch-transfer.openLocalPatchFolder', async () => {
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
+				return;
+			}
+
+			try {
+				const patchDirectory = await patchService.ensureLocalPatchDirectory(repositoryPath);
+				await vscode.commands.executeCommand(
+					'revealFileInOS',
+					vscode.Uri.file(patchDirectory),
+				);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Could not open Local Patch Folder: ${message}`);
+			}
+		}),
 		vscode.commands.registerCommand('patch-transfer.setTransferFolder', async () => {
 			if (activeOperation) {
 				vscode.window.showInformationMessage(
@@ -439,7 +537,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 					);
 				}
 				try {
-					await Promise.all([refreshChanges(), refreshPatches(repositoryPath)]);
+					await Promise.all([refreshChanges(), refreshPatches()]);
 				} finally {
 					setActiveOperation(undefined);
 				}
@@ -497,6 +595,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			}
 
 			setActiveOperation('importing');
+			let followUpCommand: 'patch-transfer.importPatchFile' | 'patch-transfer.setTransferFolder' | undefined;
 			try {
 				const folderImport = await vscode.window.withProgress(
 					{
@@ -513,7 +612,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 					return;
 				}
 
-				await refreshPatches(repositoryPath);
+				await refreshPatches();
 				for (const invalidPatch of folderImport.result.invalid) {
 					outputChannel.appendLine(
 						`[Import Patch] ${invalidPatch.patchName}: ${invalidPatch.error}`,
@@ -531,9 +630,135 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				}
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				vscode.window.showErrorMessage(`Patch import failed: ${message}`);
+				const actions = message.includes('Transfer folder is currently unavailable:')
+					? ['Import Patch File...', 'Set Transfer Folder'] as const
+					: [];
+				const selectedAction = await vscode.window.showErrorMessage(
+					`Patch import failed: ${message}`,
+					...actions,
+				);
+				if (selectedAction === 'Import Patch File...') {
+					followUpCommand = 'patch-transfer.importPatchFile';
+				} else if (selectedAction === 'Set Transfer Folder') {
+					followUpCommand = 'patch-transfer.setTransferFolder';
+				}
 			} finally {
 				setActiveOperation(undefined);
+			}
+
+			if (followUpCommand) {
+				await vscode.commands.executeCommand(followUpCommand);
+			}
+		}),
+		vscode.commands.registerCommand('patch-transfer.importPatchFile', async () => {
+			if (activeOperation) {
+				vscode.window.showInformationMessage(
+					'Another Patch Transfer Git operation is already running.',
+				);
+				return;
+			}
+
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
+				return;
+			}
+
+			const selectedFiles = await vscode.window.showOpenDialog({
+				canSelectFiles: true,
+				canSelectFolders: false,
+				canSelectMany: true,
+				filters: { 'Patch files': ['patch'] },
+				openLabel: 'Import Patch File',
+				title: 'Import Patch File...',
+			});
+			if (!selectedFiles || selectedFiles.length === 0) {
+				return;
+			}
+
+			setActiveOperation('importing');
+			try {
+				const result = await vscode.window.withProgress(
+					{
+						location: vscode.ProgressLocation.Notification,
+						title: 'Importing selected patch files...',
+						cancellable: false,
+					},
+					() => patchService.importPatchFiles(
+						repositoryPath,
+						selectedFiles.map(uri => uri.fsPath),
+					),
+				);
+
+				await refreshPatches();
+				for (const invalidPatch of result.invalid) {
+					outputChannel.appendLine(
+						`[Import Patch File] ${invalidPatch.patchName}: ${invalidPatch.error}`,
+					);
+				}
+				const summary = formatImportSummary(
+					result.imported.length,
+					result.alreadyExists.length,
+					result.invalid.length,
+				);
+				if (result.invalid.length > 0) {
+					vscode.window.showWarningMessage(summary);
+				} else {
+					vscode.window.showInformationMessage(summary);
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Patch file import failed: ${message}`);
+			} finally {
+				setActiveOperation(undefined);
+			}
+		}),
+		vscode.commands.registerCommand('patch-transfer.removeLocalPatch', async (argument?: unknown) => {
+			let operationStarted = false;
+			try {
+				if (activeOperation) {
+					vscode.window.showInformationMessage(
+						'Another Patch Transfer operation is already running.',
+					);
+					return;
+				}
+
+				const patch = getTargetPatch(argument);
+				if (!patch) {
+					vscode.window.showInformationMessage('Select a patch first.');
+					return;
+				}
+
+				const repositoryPath = await getActiveRepositoryPath();
+				if (!repositoryPath) {
+					return;
+				}
+
+				const confirmation = await vscode.window.showWarningMessage(
+					`Remove local patch "${patch.name}"?`,
+					{
+						modal: true,
+						detail: 'This deletes the local patch artifact and sidecar only. Removing the local patch does NOT undo project changes.',
+					},
+					'Remove Local Patch',
+					'Cancel',
+				);
+				if (confirmation !== 'Remove Local Patch') {
+					return;
+				}
+
+				setActiveOperation('removing');
+				operationStarted = true;
+				await patchService.removeLocalPatch(repositoryPath, patch.path);
+				await refreshPatches();
+				vscode.window.showInformationMessage(`Removed local patch: ${patch.name}`);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				outputChannel.appendLine(`[Remove Local Patch] ${message}`);
+				vscode.window.showErrorMessage(`Could not remove local patch: ${message}`);
+			} finally {
+				if (operationStarted) {
+					setActiveOperation(undefined);
+				}
 			}
 		}),
 		vscode.commands.registerCommand('patch-transfer.previewPatch', async (argument?: unknown) => {
@@ -582,14 +807,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				return;
 			}
 
-			const repositoryPath = await getActiveRepositoryPath();
-			if (!repositoryPath) {
-				return;
-			}
-
 			const patch = getTargetPatch(argument);
 			if (!patch) {
 				vscode.window.showInformationMessage('Select a patch first.');
+				return;
+			}
+
+			const repositoryPath = await getActiveRepositoryPath();
+			if (!repositoryPath) {
 				return;
 			}
 
@@ -910,26 +1135,40 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			const details = await patchService.getPatchDetails(repositoryPath, patch.path);
 			await patchDetailsPreviewProvider.show(details);
 		}),
-		vscode.commands.registerCommand('patch-transfer.refresh', refreshChanges),
-		vscode.commands.registerCommand('patch-transfer.refreshPatches', refreshPatches),
+		vscode.commands.registerCommand('patch-transfer.refresh', async () => {
+			if (await getActiveRepositoryPath()) {
+				await refreshChanges();
+			}
+		}),
+		vscode.commands.registerCommand('patch-transfer.refreshPatches', async () => {
+			if (await getActiveRepositoryPath()) {
+				await refreshPatches();
+			}
+		}),
 		fileWatcher,
 		fileWatcher.onDidCreate(handleFileEvent),
 		fileWatcher.onDidChange(handleFileEvent),
 		fileWatcher.onDidDelete(handleFileEvent),
 		patchWatcher,
-		patchWatcher.onDidCreate(schedulePatchesRefresh),
-		patchWatcher.onDidChange(schedulePatchesRefresh),
-		patchWatcher.onDidDelete(schedulePatchesRefresh),
+		patchWatcher.onDidCreate(handlePatchFileEvent),
+		patchWatcher.onDidChange(handlePatchFileEvent),
+		patchWatcher.onDidDelete(handlePatchFileEvent),
 		patchesView.onDidChangeSelection(event => {
 			const item = event.selection[0];
 			selectedPatchItem = isPatchTreeItem(item) ? item : undefined;
-			updatePatchCommandContexts(selectedPatchItem);
 		}),
 		vscode.workspace.onDidChangeWorkspaceFolders(() => {
+			void handleRepositorySetChanged();
+		}),
+		vscode.window.onDidChangeActiveTextEditor(() => {
+			if (repositoryContext.repositoryPath) {
+				return;
+			}
 			void (async () => {
-				await ensureActiveRepositorySetup();
-				await Promise.all([refreshChanges(), refreshPatches()]);
-				await changesViewProvider.refreshRepository();
+				const selectedPath = await repositoryContext.refresh();
+				if (selectedPath) {
+					await refreshRepositoryViews();
+				}
 			})();
 		}),
 		{

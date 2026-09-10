@@ -21,6 +21,11 @@ export interface GitRepository extends CommitMessageRepository {
 export class VsCodeGitRepositoryResolver {
 	private apiPromise: Promise<GitAPI | undefined> | undefined;
 
+	async getRepositoryPaths(): Promise<string[]> {
+		const api = await this.getAPI();
+		return api?.repositories.map(repository => repository.rootUri.fsPath) ?? [];
+	}
+
 	async resolve(repositoryPath: string): Promise<GitRepository | undefined> {
 		const api = await this.getAPI();
 		if (!api) {

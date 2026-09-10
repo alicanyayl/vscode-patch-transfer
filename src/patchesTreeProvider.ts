@@ -59,6 +59,7 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 	private refreshGeneration = 0;
 	private patchCount = 0;
 	private refreshError: string | undefined;
+	private currentRepositoryPath: string | undefined;
 
 	readonly onDidChangeTreeData = this.changeEmitter.event;
 
@@ -69,14 +70,16 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 		private readonly rollbackService?: RollbackService,
 	) {}
 
-	private lastRepositoryPath: string | undefined;
-
 	get count(): number {
 		return this.patchCount;
 	}
 
 	get errorMessage(): string | undefined {
 		return this.refreshError;
+	}
+
+	get repositoryPath(): string | undefined {
+		return this.currentRepositoryPath;
 	}
 
 	getCurrentPatch(patchPath: string): PatchFile | undefined {
@@ -86,12 +89,8 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 
 	async refresh(targetRepositoryPath?: string): Promise<void> {
 		const generation = ++this.refreshGeneration;
-		if (targetRepositoryPath) {
-			this.lastRepositoryPath = targetRepositoryPath;
-		}
-		const workspacePath = targetRepositoryPath ?? this.lastRepositoryPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-		const repositoryContext = workspacePath
-			? await this.gitService.getRepositoryContext(workspacePath)
+		const repositoryContext = targetRepositoryPath
+			? await this.gitService.getRepositoryContext(targetRepositoryPath)
 			: { status: 'notRepository' as const };
 		const repositoryPath = repositoryContext.status === 'repository'
 			? repositoryContext.repositoryPath
@@ -102,7 +101,6 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 		let refreshError: string | undefined;
 
 		if (repositoryPath) {
-			this.lastRepositoryPath = repositoryPath;
 			try {
 				patches = await this.patchService.listPatches(repositoryPath);
 				state = patches.length === 0 ? 'empty' : 'patches';
@@ -147,6 +145,7 @@ export class PatchesTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
 		}
 
 		this.snapshotKey = snapshotKey;
+		this.currentRepositoryPath = repositoryPath;
 		this.patches = patches;
 		this.patchCount = patches.length;
 		this.refreshError = refreshError;

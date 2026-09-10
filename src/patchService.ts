@@ -1,5 +1,5 @@
 import { constants } from 'fs';
-import { appendFile, copyFile, mkdir, readdir, readFile, stat } from 'fs/promises';
+import { appendFile, copyFile, mkdir, readdir, readFile, stat, unlink } from 'fs/promises';
 import { EOL } from 'os';
 import { basename, dirname, extname, join, resolve } from 'path';
 import { GitService } from './gitService';
@@ -298,6 +298,68 @@ export class PatchService {
 		}
 
 		return result;
+	}
+
+	async importPatchFiles(
+		workspacePath: string,
+		externalPatchPaths: readonly string[],
+	): Promise<ImportPatchesResult> {
+		const result: ImportPatchesResult = {
+			imported: [],
+			alreadyExists: [],
+			invalid: [],
+		};
+
+		for (const externalPatchPath of externalPatchPaths) {
+			const patchName = basename(externalPatchPath);
+			try {
+				const importResult = await this.importPatch(workspacePath, externalPatchPath);
+				switch (importResult.status) {
+					case 'imported':
+						result.imported.push(importResult);
+						break;
+					case 'alreadyExists':
+						result.alreadyExists.push(importResult);
+						break;
+					case 'invalid':
+						result.invalid.push({ patchName, error: importResult.error });
+						break;
+				}
+			} catch (error) {
+				result.invalid.push({ patchName, error: this.getErrorMessage(error) });
+			}
+		}
+
+		return result;
+	}
+
+	async ensureLocalPatchDirectory(workspacePath: string): Promise<string> {
+		const repositoryPath = await this.gitService.getRepositoryRoot(workspacePath);
+		if (!repositoryPath) {
+			throw new Error('Git repository not found');
+		}
+
+		await this.ensureLocalExclude(repositoryPath);
+		const patchDirectory = join(repositoryPath, '.patch-transfer');
+		await mkdir(patchDirectory, { recursive: true });
+		return patchDirectory;
+	}
+
+	async removeLocalPatch(repositoryPath: string, patchPath: string): Promise<void> {
+		const safePatchPath = this.validatePatchPath(repositoryPath, patchPath);
+		await unlink(safePatchPath);
+
+		const sidecarPath = join(
+			dirname(safePatchPath),
+			getPatchMetadataFileName(basename(safePatchPath)),
+		);
+		try {
+			await unlink(sidecarPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+				throw error;
+			}
+		}
 	}
 
 	async createPatch(workspacePath: string, commitMessage: string): Promise<CreatePatchResult> {
